@@ -1,0 +1,6 @@
+{
+  "name": "rsi-harness",
+  "version": "0.1.0",
+  "description": "Self-recursive harness improvement plugin inspired by Meta-Harness, RRSI, and SoL-Pi.",
+  "author": "noimzip"
+}

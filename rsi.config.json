@@ -1,0 +1,21 @@
+{
+  "inner_check_cmd": "python3 -m unittest discover -s tests",
+  "max_inner_retries": 2,
+  "evidence_max_chars": 10000,
+  "rrsi": {
+    "max_files": 2,
+    "max_diff_lines": 80,
+    "min_pass_rate_gain": 0.05,
+    "min_token_reduction_ratio": 0.1,
+    "max_rules_bytes": 24000,
+    "editable_prefixes": [
+      ".agents/plugins/rsi-harness/rules/",
+      ".agents/plugins/rsi-harness/skills/"
+    ],
+    "protected_prefixes": [
+      ".agents/plugins/rsi-harness/hooks.json",
+      ".agents/plugins/rsi-harness/scripts/",
+      "benchmarks/"
+    ]
+  }
+}

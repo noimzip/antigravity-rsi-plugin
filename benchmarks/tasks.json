@@ -1,0 +1,32 @@
+{
+  "suite_name": "rsi-harness-mini-bench",
+  "tasks": [
+    {
+      "id": "task_01_edge_case",
+      "title": "Fix empty-input and negative-divisor edge cases",
+      "prompt": "Fix solution.py so all unit tests in test_solution.py pass without modifying test_solution.py.",
+      "files": {
+        "solution.py": "def safe_ratio_sum(pairs: list[tuple[float, float]]) -> float:\n    total = 0.0\n    for num, den in pairs:\n        total += num / den\n    return total\n",
+        "test_solution.py": "import unittest\nfrom solution import safe_ratio_sum\n\nclass SolutionTests(unittest.TestCase):\n    def test_basic(self):\n        self.assertAlmostEqual(safe_ratio_sum([(10, 2), (9, 3)]), 8.0)\n    def test_empty(self):\n        self.assertEqual(safe_ratio_sum([]), 0.0)\n    def test_zero_denominator(self):\n        with self.assertRaises(ValueError):\n            safe_ratio_sum([(1, 0)])\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      }
+    },
+    {
+      "id": "task_02_noisy_log",
+      "title": "Diagnose real failure inside 15KB noisy log",
+      "prompt": "Run the test suite, diagnose the real error inside the noisy build output, and fix solution.py.",
+      "files": {
+        "solution.py": "def parse_kv_lines(text: str) -> dict[str, str]:\n    result = {}\n    for line in text.splitlines():\n        k, v = line.split('=')\n        result[k] = v\n    return result\n",
+        "test_solution.py": "import unittest\nfrom solution import parse_kv_lines\n\nclass NoisyLogTests(unittest.TestCase):\n    def test_noisy_build_and_blank_lines(self):\n        for i in range(250):\n            print(f'[build-info] step={i:03d} ok padding=' + 'x' * 40)\n        parsed = parse_kv_lines('host=localhost\\n\\nurl=https://example.com?a=1&b=2\\n')\n        self.assertEqual(parsed, {'host': 'localhost', 'url': 'https://example.com?a=1&b=2'})\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      }
+    },
+    {
+      "id": "task_03_multi_file_rule",
+      "title": "Preserve public signature and constants while fixing formatting",
+      "prompt": "Fix format_summary in solution.py while preserving REPORT_VERSION and type annotations, then verify all tests pass.",
+      "files": {
+        "solution.py": "REPORT_VERSION = 'v1'\n\ndef format_summary(items: list[str], limit: int = 3) -> str:\n    return ','.join(items[:limit])\n",
+        "test_solution.py": "import inspect\nimport unittest\nfrom solution import REPORT_VERSION, format_summary\n\nclass RuleComplianceTests(unittest.TestCase):\n    def test_version_preserved(self):\n        self.assertEqual(REPORT_VERSION, 'v1')\n    def test_signature_preserved(self):\n        sig = inspect.signature(format_summary)\n        self.assertEqual(list(sig.parameters.keys()), ['items', 'limit'])\n    def test_format(self):\n        self.assertEqual(format_summary(['a', 'b', 'c', 'd'], limit=2), 'v1: a, b (+2 more)')\n        self.assertEqual(format_summary([], limit=2), 'v1: (empty)')\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      }
+    }
+  ]
+}
