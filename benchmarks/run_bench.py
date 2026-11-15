@@ -144,10 +144,47 @@ def _run_agy_task(prompt: str, task_dir: Path, timeout_sec: int = 120) -> tuple[
     return tokens, raw[:500]
 
 
+def _export_task_traces(
+    task_dir: Path,
+    task_id: str,
+    runner: str,
+    tokens: int,
+    passed: bool,
+    export_dir: Path | None,
+) -> None:
+    """Copy task `.rsi/traces/*` (or emit mock trace) into ``export_dir``."""
+    if export_dir is None:
+        return
+    export_dir.mkdir(parents=True, exist_ok=True)
+    src_traces = task_dir / ".rsi" / "traces"
+    copied = False
+    if src_traces.is_dir():
+        for conv_dir in src_traces.iterdir():
+            if conv_dir.is_dir():
+                shutil.copytree(conv_dir, export_dir / conv_dir.name, dirs_exist_ok=True)
+                copied = True
+    if not copied and runner == "mock":
+        mock_dir = export_dir / f"mock-{task_id}"
+        mock_dir.mkdir(parents=True, exist_ok=True)
+        (mock_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "conversationId": f"mock-{task_id}",
+                    "total_tokens": tokens,
+                    "errors": 0 if passed else 1,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+
 def run_benchmark(
     repo_root: Path,
     manifest_path: Path,
     runner: str = "mock",
+    trace_export_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Execute benchmark suite in isolated temp directories and return metrics."""
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -183,6 +220,10 @@ def run_benchmark(
                 passed_count += 1
             total_tokens += tokens
 
+            _export_task_traces(
+                task_dir, task_id, runner, tokens, passed, trace_export_dir
+            )
+
             results.append(
                 {
                     "id": task_id,
@@ -211,14 +252,25 @@ def main() -> None:
     parser.add_argument("--repo", default=".", help="Repository root containing candidate harness")
     parser.add_argument("--manifest", default="benchmarks/tasks.json", help="Benchmark tasks JSON")
     parser.add_argument("--runner", default="mock", choices=["mock", "agy"])
+    parser.add_argument(
+        "--trace-export-dir",
+        default=None,
+        help="Optional directory to preserve per-task .rsi/traces before temp cleanup",
+    )
     args = parser.parse_args()
 
     repo_root = Path(args.repo).resolve()
     manifest_path = Path(args.manifest)
     if not manifest_path.is_absolute():
         manifest_path = (repo_root / manifest_path).resolve()
+    trace_export_dir = Path(args.trace_export_dir).resolve() if args.trace_export_dir else None
 
-    report = run_benchmark(repo_root, manifest_path, runner=args.runner)
+    report = run_benchmark(
+        repo_root,
+        manifest_path,
+        runner=args.runner,
+        trace_export_dir=trace_export_dir,
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

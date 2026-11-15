@@ -272,9 +272,16 @@ def evaluate_selection_gate(
     ]
 
 
-def _run_bench_in_repo(repo_path: Path, runner: str) -> dict[str, Any]:
+def _run_bench_in_repo(
+    repo_path: Path,
+    runner: str,
+    trace_export_dir: Path | None = None,
+) -> dict[str, Any]:
+    cmd = ["python3", "benchmarks/run_bench.py", "--repo", ".", "--runner", runner]
+    if trace_export_dir is not None:
+        cmd.extend(["--trace-export-dir", str(trace_export_dir)])
     proc = subprocess.run(
-        ["python3", "benchmarks/run_bench.py", "--repo", ".", "--runner", runner],
+        cmd,
         cwd=str(repo_path),
         capture_output=True,
         text=True,
@@ -310,7 +317,15 @@ def run_evolution_cycle(
     _git(repo, "worktree", "add", "-b", cand_branch, str(worktree_dir), base_sha)
     try:
         _seed_worktree_traces(repo, worktree_dir)
-        baseline_report = _run_bench_in_repo(worktree_dir, runner=runner)
+        wt_traces_dir = worktree_dir / ".rsi" / "traces"
+        baseline_report = _run_bench_in_repo(
+            worktree_dir, runner=runner, trace_export_dir=wt_traces_dir
+        )
+        # Persist exported baseline traces back into main repo's ignored .rsi/traces/
+        # and refresh trace_ctx so Proposer sees the real baseline execution traces.
+        if wt_traces_dir.is_dir():
+            shutil.copytree(wt_traces_dir, repo / ".rsi" / "traces", dirs_exist_ok=True)
+        trace_ctx = _collect_trace_context(worktree_dir)
 
         if runner == "mock":
             proposer_note = _mock_propose(

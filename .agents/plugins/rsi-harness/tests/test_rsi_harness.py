@@ -250,6 +250,7 @@ class OuterLoopTests(unittest.TestCase):
             self.assertTrue(ok_res["accepted"], msg=str(ok_res))
             self.assertGreater(ok_res["candidate"]["pass_rate"], ok_res["baseline"]["pass_rate"])
             self.assertLess(ok_res["candidate"]["total_tokens"], ok_res["baseline"]["total_tokens"])
+            self.assertIn("traces=3", ok_res["proposer_note"])
 
             main_after = subprocess.check_output(
                 ["git", "rev-parse", "main"], cwd=repo, text=True
