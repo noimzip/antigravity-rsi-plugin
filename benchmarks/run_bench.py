@@ -31,6 +31,16 @@ def _materialize_task(task: dict[str, Any], dest: Path, repo_root: Path) -> None
         plugin_dst = dest / ".agents" / "plugins" / "rsi-harness"
         shutil.copytree(plugin_src, plugin_dst, dirs_exist_ok=True)
 
+    task_rsi_config = {
+        "inner_check_cmd": 'python3 -m unittest discover -s . -p "test_*.py"',
+        "max_inner_retries": 2,
+        "evidence_max_chars": 10000,
+    }
+    (dest / "rsi.config.json").write_text(
+        json.dumps(task_rsi_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
 
 def _apply_mock_solution(task_id: str, task_dir: Path, rules_text: str) -> tuple[int, str]:
     """Deterministically simulate agent behavior conditioned on general rules."""

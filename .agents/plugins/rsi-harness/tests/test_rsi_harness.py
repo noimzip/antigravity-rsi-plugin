@@ -63,8 +63,22 @@ class GuardHarnessTests(unittest.TestCase):
         self.assertEqual(res_normal["decision"], "allow")
 
         os.environ["RSI_EVOLUTION_MODE"] = "1"
+        os.environ["RSI_ALLOWED_ROOT"] = str(REPO_ROOT)
         try:
-            res_evo = evaluate_tool_guard(
+            # Editable rules file inside allowed worktree root -> allowed
+            res_rules = evaluate_tool_guard(
+                {
+                    "cwd": str(REPO_ROOT),
+                    "toolCall": {
+                        "name": "write_file",
+                        "args": {"Path": str(PLUGIN_DIR / "rules" / "AGENTS.md")},
+                    },
+                }
+            )
+            self.assertEqual(res_rules["decision"], "allow")
+
+            # Protected hooks.json even in evolution mode -> denied
+            res_hooks_evo = evaluate_tool_guard(
                 {
                     "cwd": str(REPO_ROOT),
                     "toolCall": {
@@ -73,9 +87,22 @@ class GuardHarnessTests(unittest.TestCase):
                     },
                 }
             )
-            self.assertEqual(res_evo["decision"], "allow")
+            self.assertEqual(res_hooks_evo["decision"], "deny")
+
+            # Path outside RSI_ALLOWED_ROOT -> denied
+            res_outside = evaluate_tool_guard(
+                {
+                    "cwd": str(REPO_ROOT),
+                    "toolCall": {
+                        "name": "edit_file",
+                        "args": {"Path": "/tmp/outside-worktree/AGENTS.md"},
+                    },
+                }
+            )
+            self.assertEqual(res_outside["decision"], "deny")
         finally:
             os.environ.pop("RSI_EVOLUTION_MODE", None)
+            os.environ.pop("RSI_ALLOWED_ROOT", None)
 
 
 class EvidenceReducerTests(unittest.TestCase):
@@ -232,6 +259,18 @@ class OuterLoopTests(unittest.TestCase):
             ).strip()
             self.assertEqual(main_before, main_after)
             self.assertEqual(evolved_sha, ok_res["commit_sha"])
+
+    def test_materialize_task_writes_task_rsi_config(self) -> None:
+        sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
+        from run_bench import _materialize_task  # noqa: E402
+
+        tasks = json.loads((REPO_ROOT / "benchmarks" / "tasks.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "t1"
+            dest.mkdir()
+            _materialize_task(tasks["tasks"][0], dest, REPO_ROOT)
+            cfg = json.loads((dest / "rsi.config.json").read_text(encoding="utf-8"))
+            self.assertIn("test_*.py", cfg["inner_check_cmd"])
 
 
 if __name__ == "__main__":

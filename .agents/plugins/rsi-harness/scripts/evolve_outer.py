@@ -13,8 +13,10 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,27 +118,44 @@ def _mock_propose(
     )
 
 
+def _seed_worktree_traces(repo: Path, worktree: Path) -> None:
+    """Copy ignored `.rsi/traces` and history into candidate ``worktree`` readably."""
+    src_traces = repo / ".rsi" / "traces"
+    if src_traces.is_dir():
+        dst_traces = worktree / ".rsi" / "traces"
+        shutil.copytree(src_traces, dst_traces, dirs_exist_ok=True)
+    src_history = repo / ".rsi" / "evolution_history.jsonl"
+    if src_history.is_file():
+        dst_history = worktree / ".rsi" / "evolution_history.jsonl"
+        dst_history.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_history, dst_history)
+
+
 def _agy_propose(worktree: Path, trace_ctx: dict[str, Any], history: list[dict[str, Any]]) -> str:
     """Invoke Antigravity CLI as Meta-Harness Proposer inside ``worktree``."""
+    resolved_wt = worktree.resolve()
     history_tail = json.dumps(history[-5:], ensure_ascii=False)
     trace_summary = json.dumps(trace_ctx, ensure_ascii=False)
     prompt = (
-        "You are a Meta-Harness Proposer optimizing `.agents/plugins/rsi-harness/rules/AGENTS.md` "
-        "or `.agents/plugins/rsi-harness/skills/*/SKILL.md`.\n"
+        f"You are a Meta-Harness Proposer working ONLY inside worktree `{resolved_wt}`.\n"
+        f"Target files you may edit: `{resolved_wt}/.agents/plugins/rsi-harness/rules/AGENTS.md` "
+        f"or `{resolved_wt}/.agents/plugins/rsi-harness/skills/*/SKILL.md`.\n"
         "Constraints (RRSI):\n"
-        "1. Edit at most 2 files and <= 80 diff lines ONLY under `.agents/plugins/rsi-harness/rules/` "
+        f"1. NEVER read/edit any file outside `{resolved_wt}` (do NOT touch parent directories).\n"
+        "2. Edit at most 2 files and <= 80 diff lines ONLY under `.agents/plugins/rsi-harness/rules/` "
         "or `.agents/plugins/rsi-harness/skills/`.\n"
-        "2. Never touch `hooks.json`, `scripts/`, or `benchmarks/`.\n"
-        "3. Do NOT hardcode task names or test filenames; propose generalizable engineering heuristics.\n"
+        "3. Never touch `hooks.json`, `scripts/`, or `benchmarks/`.\n"
+        "4. Do NOT hardcode task names or test filenames; propose generalizable engineering heuristics.\n"
         f"Recent trace context: {trace_summary}\n"
         f"Recent evolution history (avoid failed hypotheses): {history_tail}\n"
-        "Inspect `.rsi/traces/` if present, then make one concise improvement."
+        f"Inspect `{resolved_wt}/.rsi/traces/` if present, then make one concise improvement inside `{resolved_wt}`."
     )
     env = dict(os.environ)
     env["RSI_EVOLUTION_MODE"] = "1"
+    env["RSI_ALLOWED_ROOT"] = str(resolved_wt)
     proc = subprocess.run(
         ["agy", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "json"],
-        cwd=str(worktree),
+        cwd=str(resolved_wt),
         env=env,
         capture_output=True,
         text=True,
@@ -285,11 +304,12 @@ def run_evolution_cycle(
 
     run_id = uuid.uuid4().hex[:8]
     cand_branch = f"rsi/cand-{run_id}"
-    worktree_dir = repo / ".rsi" / "worktrees" / f"cand-{run_id}"
-    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_wt_root = Path(tempfile.mkdtemp(prefix="rsi-wt-"))
+    worktree_dir = tmp_wt_root / f"cand-{run_id}"
 
     _git(repo, "worktree", "add", "-b", cand_branch, str(worktree_dir), base_sha)
     try:
+        _seed_worktree_traces(repo, worktree_dir)
         baseline_report = _run_bench_in_repo(worktree_dir, runner=runner)
 
         if runner == "mock":
@@ -352,6 +372,7 @@ def run_evolution_cycle(
     finally:
         _git(repo, "worktree", "remove", "--force", str(worktree_dir), check=False)
         _git(repo, "branch", "-D", cand_branch, check=False)
+        shutil.rmtree(tmp_wt_root, ignore_errors=True)
 
 
 def main() -> None:
