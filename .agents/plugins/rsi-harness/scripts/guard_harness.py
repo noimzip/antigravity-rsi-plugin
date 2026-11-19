@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import fnmatch
 import os
 import re
 import shlex
@@ -687,14 +688,33 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
     """Evaluate PreToolUse boundary rules from a runtime-agnostic ``NormalizedToolPreEvent``."""
     cwd_path = Path(event.cwd or ".")
     config = load_rsi_config(cwd_path)
-    protected_prefixes = (
-        tuple(config.get("rrsi", {}).get("protected_prefixes", [])) + ALWAYS_PROTECTED
+    raw_protected = (
+        tuple(config.get("protected_surface", []))
+        + tuple(config.get("rrsi", {}).get("protected_prefixes", []))
+        + ALWAYS_PROTECTED
     )
-    protected_paths = _build_protected_paths(cwd_path, protected_prefixes)
+    prefix_protected = tuple(p for p in raw_protected if not any(c in str(p) for c in "*?["))
+    glob_protected = tuple(_strip_dot_slash(str(p)) for p in raw_protected if any(c in str(p) for c in "*?["))
+    protected_paths = _build_protected_paths(cwd_path, prefix_protected)
 
     evo_mode = os.environ.get("RSI_EVOLUTION_MODE") == "1"
     allowed_root_raw = os.environ.get("RSI_ALLOWED_ROOT", "").strip()
     allowed_root = Path(allowed_root_raw) if (evo_mode and allowed_root_raw) else None
+
+    def _check_globs(raw_p: str) -> dict[str, Any] | None:
+        if not glob_protected:
+            return None
+        rel_norm = _normalize_target(raw_p, str(cwd_path))
+        for gpat in glob_protected:
+            if fnmatch.fnmatch(rel_norm, gpat):
+                return {
+                    "decision": "deny" if evo_mode else "ask",
+                    "reason": (
+                        f"Protected RSI surface pattern matched ({gpat}). "
+                        "Approve explicitly or use Outer Loop evolution mode."
+                    ),
+                }
+        return None
 
     for val in event.file_paths:
         decision = _check_path_against_boundaries(
@@ -702,6 +722,9 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
         )
         if decision is not None:
             return decision
+        glob_dec = _check_globs(val)
+        if glob_dec is not None:
+            return glob_dec
 
     for cmd_val in event.commands:
         write_targets, suspicious = _extract_shell_write_targets(cmd_val)
@@ -716,6 +739,9 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
             )
             if decision is not None:
                 return decision
+            glob_dec = _check_globs(target)
+            if glob_dec is not None:
+                return glob_dec
         if suspicious:
             normalized_cmd = cmd_val.replace("\\", "/")
             for clean_prefix, _, _ in protected_paths:

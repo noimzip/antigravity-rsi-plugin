@@ -7,11 +7,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from surface import load_yaml_file
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "inner_check_cmd": "auto",
     "inner_check_timeout_sec": None,
     "max_inner_retries": 2,
     "evidence_max_chars": 10000,
+    "mutable_surface": [],
+    "protected_surface": [],
     "reducer": {
         "provider": "none",
         "command": None,
@@ -79,17 +83,31 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def load_rsi_config(cwd: str | Path) -> dict[str, Any]:
-    """Load ``rsi.config.json`` from ``cwd`` if present, merged with defaults."""
-    config_path = Path(cwd) / "rsi.config.json"
-    if not config_path.is_file():
-        return deep_merge(DEFAULT_CONFIG, {})
-    try:
-        loaded = json.loads(config_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            return deep_merge(DEFAULT_CONFIG, loaded)
-    except (OSError, json.JSONDecodeError):
-        pass
-    return deep_merge(DEFAULT_CONFIG, {})
+    """Load config from ``harness.yaml``/``harness.yml`` and ``rsi.config.json`` merged with defaults."""
+    cwd_path = Path(cwd)
+    merged = deep_merge(DEFAULT_CONFIG, {})
+
+    for yaml_name in ("harness.yaml", "harness.yml"):
+        yaml_path = cwd_path / yaml_name
+        if yaml_path.is_file():
+            try:
+                loaded_yaml = load_yaml_file(yaml_path)
+                if isinstance(loaded_yaml, dict):
+                    merged = deep_merge(merged, loaded_yaml)
+            except (OSError, ValueError):
+                pass
+            break
+
+    config_path = cwd_path / "rsi.config.json"
+    if config_path.is_file():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                merged = deep_merge(merged, loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return merged
 
 
 def read_hook_input() -> dict[str, Any]:

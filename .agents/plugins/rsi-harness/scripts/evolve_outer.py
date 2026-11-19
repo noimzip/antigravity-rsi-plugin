@@ -39,6 +39,7 @@ try:
 except ImportError:
     def load_benchmark_suite(manifest_or_dir: Path) -> dict[str, Any]:
         return json.loads(manifest_or_dir.read_text(encoding="utf-8"))
+from surface import resolve_mutable_surface  # noqa: E402
 from trace_store import TraceStore  # noqa: E402
 
 
@@ -92,9 +93,13 @@ def _mock_propose(
     trace_ctx: dict[str, Any],
     history: list[dict[str, Any]],
     override_mode: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic Proposer for offline tests and dry-runs."""
-    rules_path = worktree / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md"
+    cfg = config or load_rsi_config(worktree)
+    surface = resolve_mutable_surface(worktree, cfg)
+    rules_path = surface.primary_rules_path(worktree)
+    rules_path.parent.mkdir(parents=True, exist_ok=True)
     current = rules_path.read_text(encoding="utf-8") if rules_path.is_file() else ""
 
     if override_mode == "leak":
@@ -111,6 +116,7 @@ def _mock_propose(
 
     if override_mode == "protected":
         hooks_path = worktree / ".agents" / "plugins" / "rsi-harness" / "hooks.json"
+        hooks_path.parent.mkdir(parents=True, exist_ok=True)
         hooks_path.write_text("{}\n", encoding="utf-8")
         return "Injected protected file edit for testing guard"
 
@@ -143,18 +149,29 @@ def _build_proposer_prompt(
     resolved_wt: Path,
     trace_ctx: dict[str, Any],
     history: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
 ) -> str:
+    cfg = config or load_rsi_config(resolved_wt)
+    rrsi = cfg.get("rrsi") if isinstance(cfg.get("rrsi"), dict) else {}
+    surface = resolve_mutable_surface(resolved_wt, cfg)
+    max_files = int(rrsi.get("max_files", 2))
+    max_diff_lines = int(rrsi.get("max_diff_lines", 80))
+
+    target_desc = (
+        ", ".join(f"`{resolved_wt}/{e.path}` ({e.role})" for e in surface.entries)
+        or f"`{resolved_wt}/.agents/plugins/rsi-harness/rules/AGENTS.md`"
+    )
+    protected_desc = ", ".join(f"`{p}`" for p in surface.protected_patterns) or "`hooks.json`, `scripts/`, `benchmarks/`"
     history_tail = json.dumps(history[-5:], ensure_ascii=False)
     trace_summary = json.dumps(trace_ctx, ensure_ascii=False)
     return (
         f"You are a Meta-Harness Proposer working ONLY inside worktree `{resolved_wt}`.\n"
-        f"Target files you may edit: `{resolved_wt}/.agents/plugins/rsi-harness/rules/AGENTS.md` "
-        f"or `{resolved_wt}/.agents/plugins/rsi-harness/skills/*/SKILL.md`.\n"
+        f"Target mutable surface you may edit: {target_desc}.\n"
         "Constraints (RRSI):\n"
         f"1. NEVER read/edit any file outside `{resolved_wt}` (do NOT touch parent directories).\n"
-        "2. Edit at most 2 files and <= 80 diff lines ONLY under `.agents/plugins/rsi-harness/rules/` "
-        "or `.agents/plugins/rsi-harness/skills/`.\n"
-        "3. Never touch `hooks.json`, `scripts/`, or `benchmarks/`.\n"
+        f"2. Edit at most {max_files} files, <= {max_diff_lines} diff lines, and <= {surface.total_max_bytes} total surface bytes "
+        "ONLY within the declared mutable surface.\n"
+        f"3. Never touch protected paths: {protected_desc}.\n"
         "4. Do NOT hardcode task names or test filenames; propose generalizable engineering heuristics.\n"
         f"Recent trace context: {trace_summary}\n"
         f"Recent evolution history (avoid failed hypotheses): {history_tail}\n"
@@ -173,7 +190,7 @@ def _runtime_propose(
 ) -> str:
     """Invoke configured runtime adapter as Meta-Harness Proposer inside ``worktree``."""
     resolved_wt = worktree.resolve()
-    prompt = _build_proposer_prompt(resolved_wt, trace_ctx, history)
+    prompt = _build_proposer_prompt(resolved_wt, trace_ctx, history, config=config)
     runtime_cfg = (config or {}).get("runtime") if isinstance((config or {}).get("runtime"), dict) else {}
     adapter = get_runtime_adapter(runner, runtime_cfg)
     timeout_sec = int(runtime_cfg.get("proposer_timeout_sec", 180))
@@ -288,9 +305,7 @@ def validate_proposal_rrsi(
     rrsi = config.get("rrsi", {})
     max_files = int(rrsi.get("max_files", 2))
     max_diff_lines = int(rrsi.get("max_diff_lines", 80))
-    max_rules_bytes = int(rrsi.get("max_rules_bytes", 24000))
-    editable_prefixes = tuple(rrsi.get("editable_prefixes", []))
-    protected_prefixes = tuple(rrsi.get("protected_prefixes", []))
+    surface = resolve_mutable_surface(worktree, config)
 
     status_out = _git(worktree, "status", "--porcelain").stdout.splitlines()
     changed_files: list[str] = []
@@ -315,9 +330,9 @@ def validate_proposal_rrsi(
 
     reasons: list[str] = []
     for rel in changed_files:
-        if any(rel.startswith(p) for p in protected_prefixes):
+        if surface.matches_protected(rel) is not None:
             reasons.append(f"protected_file_modified:{rel}")
-        elif editable_prefixes and not any(rel.startswith(p) for p in editable_prefixes):
+        elif surface.entries and surface.matches_mutable(rel) is None:
             reasons.append(f"out_of_scope_file:{rel}")
 
     if len(changed_files) > max_files:
@@ -370,17 +385,16 @@ def validate_proposal_rrsi(
                     flagged_hashes.add(ah)
                     reasons.append(f"critic_benchmark_leakage:expected_hash:{ah}")
 
-    rules_file = worktree / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md"
-    rules_bytes = len(rules_file.read_bytes()) if rules_file.is_file() else 0
-    if rules_bytes > max_rules_bytes:
-        reasons.append(f"rules_budget_exceeded:{rules_bytes}>{max_rules_bytes}")
+    rules_bytes, surface_bytes, budget_violations = surface.compute_surface_bytes(worktree)
+    reasons.extend(budget_violations)
 
     meta = {
         "changed_files": changed_files,
         "diff_lines": diff_lines,
         "diff_hash": diff_hash,
         "rules_bytes": rules_bytes,
-        "pruning_recommended": rules_bytes > int(max_rules_bytes * 0.75),
+        "surface_bytes": surface_bytes,
+        "pruning_recommended": rules_bytes > int(surface.total_max_bytes * 0.75),
     }
     return len(reasons) == 0, reasons, meta
 
@@ -523,9 +537,11 @@ def _run_bench_in_repo(
     manifest_path: Path | None = None,
     split: str | None = None,
 ) -> dict[str, Any]:
+    local_bench = repo_path / "benchmarks" / "run_bench.py"
+    bench_script = "benchmarks/run_bench.py" if local_bench.is_file() else str(BENCHMARKS_DIR / "run_bench.py")
     cmd = [
         "python3",
-        "benchmarks/run_bench.py",
+        bench_script,
         "--repo",
         ".",
         "--runner",
@@ -658,7 +674,7 @@ def run_evolution_cycle(
 
         if runner == "mock":
             proposer_note = _mock_propose(
-                worktree_dir, trace_ctx, history, override_mode=mock_bad_proposal
+                worktree_dir, trace_ctx, history, override_mode=mock_bad_proposal, config=config
             )
         elif runner == "agy":
             proposer_note = _agy_propose(worktree_dir, trace_ctx, history, config=config)

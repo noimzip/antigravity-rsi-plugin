@@ -25,9 +25,17 @@ if _SCRIPTS_DIR.is_dir() and str(_SCRIPTS_DIR) not in sys.path:
 from adapters.runtime import AgyAdapter, get_runtime_adapter, list_runtime_adapters  # noqa: E402
 from adapters.sandbox import get_sandbox_adapter  # noqa: E402
 from common import load_rsi_config  # noqa: E402
+from surface import resolve_mutable_surface  # noqa: E402
 
 
 def _load_rules_text(repo_root: Path) -> str:
+    cfg = load_rsi_config(repo_root)
+    surface = resolve_mutable_surface(repo_root, cfg)
+    rule_files = surface.list_existing_files(repo_root, role="rules")
+    if rule_files:
+        chunks = [f.read_text(encoding="utf-8", errors="replace") for f in rule_files if f.is_file()]
+        if chunks:
+            return "\n\n".join(chunks)
     rules_file = repo_root / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md"
     if not rules_file.is_file():
         return ""
@@ -108,7 +116,12 @@ def _materialize_task(task: dict[str, Any], dest: Path, repo_root: Path) -> dict
             if not src_dir.is_absolute():
                 src_dir = (base_dir / src_dir).resolve()
             if src_dir.is_dir():
-                shutil.copytree(src_dir, dest, dirs_exist_ok=True)
+                shutil.copytree(
+                    src_dir,
+                    dest,
+                    ignore=shutil.ignore_patterns(".git", ".rsi", "__pycache__", ".pytest_cache"),
+                    dirs_exist_ok=True,
+                )
 
         if env_cfg.get("git_repo"):
             raw_repo = str(env_cfg["git_repo"])
@@ -153,6 +166,21 @@ def _materialize_task(task: dict[str, Any], dest: Path, repo_root: Path) -> dict
     if plugin_src.is_dir():
         plugin_dst = dest / ".agents" / "plugins" / "rsi-harness"
         shutil.copytree(plugin_src, plugin_dst, dirs_exist_ok=True)
+
+    # Sync declarative mutable surface files & harness.yaml so custom repos pass rules into task env.
+    repo_cfg = load_rsi_config(repo_root)
+    surface = resolve_mutable_surface(repo_root, repo_cfg)
+    repo_res = repo_root.resolve()
+    for src_file in surface.list_existing_files(repo_res):
+        rel = src_file.resolve().relative_to(repo_res)
+        dst_file = dest / rel
+        if src_file.resolve() != dst_file.resolve():
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst_file)
+    for yaml_name in ("harness.yaml", "harness.yml"):
+        yp = repo_res / yaml_name
+        if yp.is_file():
+            shutil.copy2(yp, dest / yaml_name)
 
     cfg_path = dest / "rsi.config.json"
     if not cfg_path.is_file():
