@@ -283,6 +283,15 @@ def _apply_mock_solution(task_id: str, task_dir: Path, rules_text: str) -> tuple
             return 1100 + extra_tokens, "mock_applied_harbor_sample_calc"
         return 2200 + extra_tokens, "mock_missed_harbor_sample_calc"
 
+    if task_id.startswith("mined_"):
+        has_mined_opt = any(
+            k in lower
+            for k in ("最小差分", "再実行", "検証し", "失敗行周辺", "verify", "minimal diff")
+        )
+        if has_mined_opt:
+            return 1600 + extra_tokens, f"mock_optimized_{task_id}"
+        return 3200 + extra_tokens, f"mock_baseline_{task_id}"
+
     return 1500 + extra_tokens, "mock_unknown"
 
 

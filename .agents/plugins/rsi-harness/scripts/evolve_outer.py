@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ except ImportError:
         return json.loads(manifest_or_dir.read_text(encoding="utf-8"))
 from surface import resolve_mutable_surface  # noqa: E402
 from trace_store import TraceStore  # noqa: E402
+from weakness_miner import mine_weaknesses, synthesize_regression_suite  # noqa: E402
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -585,6 +587,7 @@ def run_evolution_cycle(
     runner: str = "mock",
     mock_bad_proposal: str | None = None,
     manifest_path: Path | None = None,
+    mode: str = "auto",
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
@@ -596,11 +599,37 @@ def run_evolution_cycle(
     history = load_jsonl(history_path)
     trace_ctx = _collect_trace_context(repo)
 
-    effective_manifest = (
-        Path(manifest_path).resolve()
-        if manifest_path is not None
-        else (repo / "benchmarks" / "tasks.json").resolve()
+    default_manifest = repo / "benchmarks" / "tasks.json"
+    use_trace_mined = mode == "trace-mined" or (
+        mode == "auto" and manifest_path is None and not default_manifest.is_file()
     )
+    evolution_mode = "trace-mined" if use_trace_mined else "benchmark"
+    mined_clusters: list[dict[str, Any]] = []
+
+    if use_trace_mined:
+        clusters = mine_weaknesses(repo)
+        if not clusters:
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": uuid.uuid4().hex[:8],
+                "branch": branch,
+                "evolution_mode": evolution_mode,
+                "accepted": False,
+                "stage": "weakness_miner",
+                "reasons": ["no_weakness_clusters_found"],
+                "mined_clusters": [],
+            }
+            append_jsonl(history_path, record)
+            return record
+        mined_clusters = [asdict(c) for c in clusters[:5]]
+        effective_manifest = (repo / ".rsi" / "mined_tasks.json").resolve()
+        synthesize_regression_suite(repo, clusters, output_path=effective_manifest)
+    else:
+        effective_manifest = (
+            Path(manifest_path).resolve()
+            if manifest_path is not None
+            else default_manifest.resolve()
+        )
     suite = load_benchmark_suite(effective_manifest)
     all_tasks = suite.get("tasks", [])
     leakage_profile = build_leakage_fingerprint(all_tasks, effective_manifest)
@@ -714,6 +743,8 @@ def run_evolution_cycle(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "run_id": run_id,
                 "branch": branch,
+                "evolution_mode": evolution_mode,
+                "mined_clusters": mined_clusters,
                 "split_mode": split_mode,
                 "n_trials": n_trials,
                 "accepted": False,
@@ -805,6 +836,8 @@ def run_evolution_cycle(
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": run_id,
             "branch": branch,
+            "evolution_mode": evolution_mode,
+            "mined_clusters": mined_clusters,
             "split_mode": split_mode,
             "n_trials": n_trials,
             "accepted": sel_ok,
@@ -835,6 +868,12 @@ def main() -> None:
     parser.add_argument("--runner", default="mock", choices=["mock", *list_runtime_adapters()])
     parser.add_argument("--manifest", default=None, help="Optional benchmark manifest path or Harbor directory")
     parser.add_argument(
+        "--mode",
+        default="auto",
+        choices=["auto", "benchmark", "trace-mined"],
+        help="Evolution mode: auto (falls back to trace-mined if tasks.json absent), benchmark, or trace-mined",
+    )
+    parser.add_argument(
         "--mock-bad-proposal",
         default=None,
         choices=["leak", "budget", "protected"],
@@ -848,6 +887,7 @@ def main() -> None:
         runner=args.runner,
         mock_bad_proposal=args.mock_bad_proposal,
         manifest_path=Path(args.manifest) if args.manifest else None,
+        mode=args.mode,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
