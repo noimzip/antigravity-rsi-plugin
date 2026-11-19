@@ -21,6 +21,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(REPO_ROOT / "benchmarks") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
 
+from adapters.sandbox import (  # noqa: E402
+    DockerSandbox,
+    GitWorktreeSandbox,
+    RemoteSandboxAdapter,
+    SandboxConfig,
+    SandboxExecResult,
+    get_sandbox_adapter,
+)
 from common import load_rsi_config  # noqa: E402
 from evidence_reducer import deterministic_error_slice, reduce_log  # noqa: E402
 from inner_gate import evaluate_stop  # noqa: E402
@@ -247,6 +255,132 @@ class HarborContractTests(unittest.TestCase):
                 os.environ["PATH"] = orig_path
             self.assertEqual(pass_rep["passed_tasks"], 1)
             self.assertEqual(pass_rep["total_tokens"], 321)
+
+
+class SandboxAdapterTests(unittest.TestCase):
+    def _init_repo(self, dest: Path) -> str:
+        shutil.copytree(
+            REPO_ROOT,
+            dest,
+            ignore=shutil.ignore_patterns(".git", ".rsi", "__pycache__"),
+            dirs_exist_ok=True,
+        )
+        subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "RSI Test"], cwd=dest, check=True)
+        subprocess.run(["git", "config", "user.email", "rsi@example.com"], cwd=dest, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=dest, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=dest, check=True, capture_output=True)
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=dest, text=True).strip()
+
+    def test_git_worktree_sandbox_lifecycle_and_readonly_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            sha = self._init_repo(repo)
+            src_file = root / "secret_ro.txt"
+            src_file.write_text("immutable", encoding="utf-8")
+
+            sb = get_sandbox_adapter({"sandbox": {"backend": "worktree"}})
+            self.assertIsInstance(sb, GitWorktreeSandbox)
+            wt = sb.prepare(repo, sha, "run01")
+            self.assertTrue(wt.is_dir())
+
+            synced = sb.sync_files(src_file, "synced/secret_ro.txt", read_only=True)
+            self.assertTrue(synced.is_file())
+            self.assertEqual(synced.stat().st_mode & 0o222, 0)
+
+            res = sb.exec(["python3", "-c", "print('inside-wt')"])
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("inside-wt", res.stdout)
+
+            sb.cleanup()
+            self.assertFalse(wt.exists())
+            branches = subprocess.check_output(["git", "branch"], cwd=repo, text=True)
+            self.assertNotIn("rsi/cand-run01", branches)
+
+    def test_docker_sandbox_hardened_command_and_fake_docker_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            sha = self._init_repo(repo)
+
+            fake_docker = root / "fake_docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "print(json.dumps({'argv': sys.argv[1:]}))\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IEXEC)
+
+            ro_host = root / "readonly_verifier"
+            ro_host.mkdir()
+            sb = get_sandbox_adapter(
+                {
+                    "sandbox": {
+                        "backend": "docker",
+                        "docker_bin": str(fake_docker),
+                        "docker_image": "python:3.12-slim",
+                        "network_disabled": True,
+                        "cpus": 2.0,
+                        "memory_mb": 512,
+                        "pids_limit": 64,
+                        "read_only_root": True,
+                    }
+                }
+            )
+            self.assertIsInstance(sb, DockerSandbox)
+            wt = sb.prepare(repo, sha, "dock01")
+            try:
+                cmd = sb.build_docker_command(
+                    ["python3", "-m", "unittest"],
+                    env={"RSI_TEST": "1"},
+                    readonly_mounts=[(ro_host, "/verifier")],
+                )
+                self.assertIn("--network", cmd)
+                self.assertEqual(cmd[cmd.index("--network") + 1], "none")
+                self.assertEqual(cmd[cmd.index("--cpus") + 1], "2.0")
+                self.assertEqual(cmd[cmd.index("--memory") + 1], "512m")
+                self.assertEqual(cmd[cmd.index("--pids-limit") + 1], "64")
+                self.assertIn("--cap-drop=ALL", cmd)
+                self.assertIn("--security-opt=no-new-privileges", cmd)
+                self.assertIn("--read-only", cmd)
+                self.assertIn(f"{ro_host.resolve()}:/verifier:ro", cmd)
+
+                res = sb.exec(["pytest", "-q"], readonly_mounts=[(ro_host, "/verifier")])
+                self.assertEqual(res.returncode, 0)
+                captured = json.loads(res.stdout)
+                self.assertIn("python:3.12-slim", captured["argv"])
+                self.assertEqual(captured["argv"][-2:], ["pytest", "-q"])
+            finally:
+                sb.cleanup()
+
+    def test_remote_sandbox_hook_and_unknown_backend(self) -> None:
+        remote = get_sandbox_adapter({"sandbox": {"backend": "remote"}})
+        self.assertIsInstance(remote, RemoteSandboxAdapter)
+        with self.assertRaises(NotImplementedError):
+            remote.prepare(REPO_ROOT, "HEAD", "rem01")
+
+        class _MockDriver:
+            def prepare(self, repo, base_sha, run_id):
+                return repo
+
+            def sync_files(self, src, rel_dest, *, read_only=False):
+                return src
+
+            def exec(self, cmd, *, cwd=None, env=None, timeout=120, readonly_mounts=None):
+                return SandboxExecResult(returncode=0, stdout="remote-ok")
+
+            def cleanup(self):
+                return None
+
+        wired = RemoteSandboxAdapter(SandboxConfig(backend="remote"), driver=_MockDriver())
+        wired.prepare(REPO_ROOT, "HEAD", "rem02")
+        self.assertEqual(wired.exec("echo hi").stdout, "remote-ok")
+        wired.cleanup()
+
+        with self.assertRaises(ValueError):
+            get_sandbox_adapter({"sandbox": {"backend": "invalid-backend"}})
 
 
 if __name__ == "__main__":

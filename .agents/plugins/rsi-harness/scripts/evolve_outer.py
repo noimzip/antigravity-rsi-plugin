@@ -28,6 +28,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from adapters.runtime import get_runtime_adapter, list_runtime_adapters  # noqa: E402
+from adapters.sandbox import SandboxAdapter, get_sandbox_adapter  # noqa: E402
 from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
 from trace_store import TraceStore  # noqa: E402
 
@@ -395,6 +396,7 @@ def _run_bench_in_repo(
     runner: str,
     trace_export_dir: Path | None = None,
     n_trials: int = 1,
+    sandbox: SandboxAdapter | None = None,
 ) -> dict[str, Any]:
     cmd = [
         "python3",
@@ -407,7 +409,16 @@ def _run_bench_in_repo(
         str(max(1, n_trials)),
     ]
     if trace_export_dir is not None:
-        cmd.extend(["--trace-export-dir", str(trace_export_dir)])
+        try:
+            export_arg = trace_export_dir.resolve().relative_to(repo_path.resolve()).as_posix()
+        except ValueError:
+            export_arg = str(trace_export_dir)
+        cmd.extend(["--trace-export-dir", export_arg])
+    if sandbox is not None:
+        res = sandbox.exec(cmd, cwd=repo_path, timeout=300)
+        if res.returncode != 0:
+            raise subprocess.CalledProcessError(res.returncode, res.command, res.stdout, res.stderr)
+        return json.loads(res.stdout)
     proc = subprocess.run(
         cmd,
         cwd=str(repo_path),
@@ -439,11 +450,8 @@ def run_evolution_cycle(
     base_sha = _ensure_branch(repo, branch)
 
     run_id = uuid.uuid4().hex[:8]
-    cand_branch = f"rsi/cand-{run_id}"
-    tmp_wt_root = Path(tempfile.mkdtemp(prefix="rsi-wt-"))
-    worktree_dir = tmp_wt_root / f"cand-{run_id}"
-
-    _git(repo, "worktree", "add", "-b", cand_branch, str(worktree_dir), base_sha)
+    sandbox = get_sandbox_adapter(config)
+    worktree_dir = sandbox.prepare(repo, base_sha, run_id)
     try:
         _seed_worktree_traces(repo, worktree_dir)
         wt_traces_dir = worktree_dir / ".rsi" / "traces"
@@ -452,6 +460,7 @@ def run_evolution_cycle(
             runner=runner,
             trace_export_dir=wt_traces_dir,
             n_trials=n_trials,
+            sandbox=sandbox,
         )
         # Persist exported baseline traces back into main repo's ignored .rsi/traces/
         # and refresh trace_ctx so Proposer sees the real baseline execution traces.
@@ -516,6 +525,7 @@ def run_evolution_cycle(
             runner=runner,
             trace_export_dir=cand_traces_dir,
             n_trials=n_trials,
+            sandbox=sandbox,
         )
         sel_diag = compute_selection_diagnostics(baseline_report, candidate_report, config)
         sel_ok = bool(sel_diag["accepted"])
@@ -572,9 +582,7 @@ def run_evolution_cycle(
         append_jsonl(history_path, record)
         return record
     finally:
-        _git(repo, "worktree", "remove", "--force", str(worktree_dir), check=False)
-        _git(repo, "branch", "-D", cand_branch, check=False)
-        shutil.rmtree(tmp_wt_root, ignore_errors=True)
+        sandbox.cleanup()
 
 
 def main() -> None:

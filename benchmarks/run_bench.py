@@ -22,6 +22,7 @@ if _SCRIPTS_DIR.is_dir() and str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from adapters.runtime import AgyAdapter, get_runtime_adapter, list_runtime_adapters  # noqa: E402
+from adapters.sandbox import get_sandbox_adapter  # noqa: E402
 from common import load_rsi_config  # noqa: E402
 
 
@@ -523,6 +524,7 @@ def run_benchmark(
     runner: str = "mock",
     trace_export_dir: Path | None = None,
     n_trials: int = 1,
+    sandbox_backend: str | None = None,
 ) -> dict[str, Any]:
     """Execute benchmark suite over ``n_trials`` isolated runs and aggregate metrics."""
     if n_trials < 1:
@@ -533,6 +535,9 @@ def run_benchmark(
     tasks = manifest.get("tasks", [])
     cfg = load_rsi_config(repo_root)
     runtime_config = cfg.get("runtime") if isinstance(cfg.get("runtime"), dict) else None
+    if sandbox_backend:
+        # Validate requested sandbox adapter early via registry factory
+        _ = get_sandbox_adapter({"sandbox": {**(cfg.get("sandbox") or {}), "backend": sandbox_backend}})
 
     trials: list[dict[str, Any]] = []
     for trial_idx in range(1, n_trials + 1):
@@ -587,6 +592,12 @@ def main() -> None:
         default=None,
         help="Optional directory to preserve per-task .rsi/traces before temp cleanup",
     )
+    parser.add_argument(
+        "--sandbox-backend",
+        default=None,
+        choices=["worktree", "docker", "remote"],
+        help="Optional sandbox backend validation override",
+    )
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be >= 1")
@@ -603,6 +614,7 @@ def main() -> None:
         runner=args.runner,
         trace_export_dir=trace_export_dir,
         n_trials=args.trials,
+        sandbox_backend=args.sandbox_backend,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

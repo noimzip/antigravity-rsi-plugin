@@ -25,12 +25,24 @@ from .runtime import (
     list_runtime_adapters,
     register_runtime_adapter,
 )
+from .sandbox import (
+    DockerSandbox,
+    GitWorktreeSandbox,
+    RemoteSandboxAdapter,
+    SandboxAdapter,
+    SandboxConfig,
+    SandboxExecResult,
+    get_sandbox_adapter,
+)
 
 __all__ = [
+    "DockerSandbox",
+    "GitWorktreeSandbox",
     "NormalizedStopEvent",
     "NormalizedToolPostEvent",
     "NormalizedToolPreEvent",
     "RUNTIME_REGISTRY",
+    "RemoteSandboxAdapter",
     "AgentRuntimeAdapter",
     "AgyAdapter",
     "ClaudeCodeAdapter",
@@ -38,8 +50,12 @@ __all__ = [
     "GeminiCliAdapter",
     "PtyWrapperAdapter",
     "RuntimeRunResult",
+    "SandboxAdapter",
+    "SandboxConfig",
+    "SandboxExecResult",
     "detect_hook_runtime",
     "get_runtime_adapter",
+    "get_sandbox_adapter",
     "list_runtime_adapters",
     "normalize_post_tool_event",
     "normalize_pre_tool_event",
