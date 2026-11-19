@@ -32,7 +32,11 @@ from adapters.runtime import (  # noqa: E402
     list_runtime_adapters,
     register_runtime_adapter,
 )
+from common import load_jsonl  # noqa: E402
+from guard_harness import evaluate_tool_guard  # noqa: E402
+from inner_gate import evaluate_stop  # noqa: E402
 from run_bench import run_benchmark  # noqa: E402
+from trace_collector import record_event  # noqa: E402
 
 
 class RuntimeAdapterTests(unittest.TestCase):
@@ -198,6 +202,160 @@ class RuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(report["runner"], "claude")
         self.assertEqual(report["total_tasks"], 3)
         self.assertEqual(report["total_tokens"], 1200)
+
+
+class EventNormalizerTests(unittest.TestCase):
+    def test_guard_across_antigravity_claude_codex_and_gemini_payloads(self) -> None:
+        os.environ.pop("RSI_EVOLUTION_MODE", None)
+
+        # Antigravity blocked
+        ag_block = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "toolCall": {"name": "write_file", "args": {"Path": ".agents/plugins/rsi-harness/hooks.json"}},
+            }
+        )
+        self.assertEqual(ag_block["decision"], "ask")
+
+        # Claude Code Write blocked -> hookSpecificOutput format
+        cc_block = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "session_id": "cc-sess-1",
+                "tool_name": "Write",
+                "tool_input": {"file_path": ".agents/plugins/rsi-harness/hooks.json"},
+            }
+        )
+        self.assertEqual(cc_block["hookSpecificOutput"]["hookEventName"], "PreToolUse")
+        self.assertEqual(cc_block["hookSpecificOutput"]["permissionDecision"], "ask")
+
+        # Claude Code Bash redirect blocked
+        cc_bash_block = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "session_id": "cc-sess-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo x > benchmarks/tasks.json"},
+            }
+        )
+        self.assertEqual(cc_bash_block["hookSpecificOutput"]["permissionDecision"], "ask")
+
+        # Claude Code allowed edit
+        cc_allow = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "session_id": "cc-sess-1",
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "src/tasklib.py"},
+            }
+        )
+        self.assertEqual(cc_allow["hookSpecificOutput"]["permissionDecision"], "allow")
+
+        # Codex blocked
+        codex_block = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "call_id": "cx-1",
+                "name": "shell",
+                "arguments": json.dumps({"command": "rm benchmarks/tasks.json"}),
+            }
+        )
+        self.assertEqual(codex_block["decision"], "ask")
+
+        # Gemini blocked & allowed
+        gem_block = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "functionCall": {"name": "write_file", "args": {"file_path": "benchmarks/tasks.json"}},
+            }
+        )
+        self.assertEqual(gem_block["decision"], "ask")
+        gem_allow = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "functionCall": {"name": "read_file", "args": {"command": "cat benchmarks/tasks.json"}},
+            }
+        )
+        self.assertEqual(gem_allow["decision"], "allow")
+
+    def test_trace_collector_and_inner_gate_runtime_agnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "rsi.config.json").write_text(
+                json.dumps(
+                    {
+                        "inner_check_cmd": "python3 -c \"import sys; print('ValueError: fail'); sys.exit(1)\"",
+                        "max_inner_retries": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            transcript = cwd / "cc_transcript.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "step_index": 0,
+                        "status": "DONE",
+                        "input_tokens": 50,
+                        "cache_read_tokens": 10,
+                        "output_tokens": 40,
+                        "tool_calls": [{"name": "Edit"}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = record_event(
+                {
+                    "session_id": "cc-conv-1",
+                    "cwd": str(cwd),
+                    "transcript_path": str(transcript),
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/tasklib.py"},
+                    "hook_event_name": "PostToolUse",
+                },
+                "post_tool",
+            )
+            self.assertEqual(summary["conversationId"], "cc-conv-1")
+            self.assertEqual(summary["runtime"], "claude_code")
+            self.assertEqual(summary["total_tokens"], 100)
+            events = load_jsonl(cwd / ".rsi" / "traces" / "cc-conv-1" / "events.jsonl")
+            self.assertEqual(events[0]["toolName"], "Edit")
+            self.assertEqual(events[0]["runtime"], "claude_code")
+
+            # Claude Code stop payload -> returns decision: "block"
+            cc_stop = evaluate_stop(
+                {
+                    "session_id": "cc-conv-1",
+                    "cwd": str(cwd),
+                    "transcript_path": str(transcript),
+                    "stop_hook_active": False,
+                }
+            )
+            self.assertEqual(cc_stop["decision"], "block")
+            self.assertIn("ValueError: fail", cc_stop["reason"])
+
+            # stop_hook_active=True -> allows stop immediately
+            cc_active = evaluate_stop(
+                {
+                    "session_id": "cc-conv-1",
+                    "cwd": str(cwd),
+                    "transcript_path": str(transcript),
+                    "stop_hook_active": True,
+                }
+            )
+            self.assertEqual(cc_active, {})
+
+            # Antigravity stop payload -> returns decision: "continue"
+            agy_stop = evaluate_stop(
+                {
+                    "conversationId": "agy-conv-1",
+                    "cwd": str(cwd),
+                    "continuationActive": False,
+                }
+            )
+            self.assertEqual(agy_stop["decision"], "continue")
 
 
 if __name__ == "__main__":

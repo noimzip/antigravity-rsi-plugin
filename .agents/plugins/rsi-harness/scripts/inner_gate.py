@@ -8,9 +8,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from adapters.events import normalize_stop_event, serialize_hook_response
 from common import load_rsi_config, read_hook_input, write_hook_output
 from evidence_reducer import build_summarizer_from_config, reduce_log
-from trace_collector import record_event
+from trace_collector import record_normalized_event
 
 
 def _read_retry_count(path: Path) -> int:
@@ -23,19 +24,20 @@ def _read_retry_count(path: Path) -> int:
 
 
 def evaluate_stop(payload: dict[str, Any]) -> dict[str, Any]:
-    """Run trace persistence and bounded inner-loop verification."""
+    """Run trace persistence and bounded inner-loop verification via normalized events."""
     if not payload:
         return {}
 
-    record_event(payload, "stop")
+    event = normalize_stop_event(payload)
+    record_normalized_event(event, "stop")
 
-    if payload.get("continuationActive"):
+    if event.continuation_active:
         return {}
     if os.environ.get("RSI_INNER_GATE_RUNNING") == "1":
         return {}
 
-    cwd = Path(str(payload.get("cwd") or "."))
-    conversation_id = str(payload.get("conversationId") or "unknown")
+    cwd = Path(event.cwd or ".")
+    conversation_id = event.conversation_id or "unknown"
     config = load_rsi_config(cwd)
 
     check_cmd = str(config.get("inner_check_cmd") or "").strip()
@@ -70,13 +72,17 @@ def evaluate_stop(payload: dict[str, Any]) -> dict[str, Any]:
     combined_log = (result.stdout or "") + "\n" + (result.stderr or "")
     summarizer = build_summarizer_from_config(config, cwd=cwd)
     reduced = reduce_log(combined_log, max_chars=max_chars, summarizer=summarizer)
-    return {
-        "decision": "continue",
-        "reason": (
-            f"Inner check failed (retry {retries + 1}/{max_retries}). "
-            f"Fix the issue based on verified output:\n{reduced['reduced_text']}"
-        ),
-    }
+    return serialize_hook_response(
+        event.runtime,
+        "stop",
+        {
+            "decision": "continue",
+            "reason": (
+                f"Inner check failed (retry {retries + 1}/{max_retries}). "
+                f"Fix the issue based on verified output:\n{reduced['reduced_text']}"
+            ),
+        },
+    )
 
 
 def main() -> None:

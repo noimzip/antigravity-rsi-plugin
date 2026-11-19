@@ -10,6 +10,11 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from adapters.events import (
+    NormalizedToolPreEvent,
+    normalize_pre_tool_event,
+    serialize_hook_response,
+)
 from common import load_rsi_config, read_hook_input, write_hook_output
 
 ALWAYS_PROTECTED = (
@@ -678,58 +683,59 @@ def _extract_shell_write_targets(command: str, _depth: int = 0) -> tuple[list[st
     return write_targets, suspicious
 
 
-def evaluate_tool_guard(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return PreToolUse decision dict for ``payload``."""
-    cwd_path = Path(str(payload.get("cwd") or "."))
+def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, Any]:
+    """Evaluate PreToolUse boundary rules from a runtime-agnostic ``NormalizedToolPreEvent``."""
+    cwd_path = Path(event.cwd or ".")
     config = load_rsi_config(cwd_path)
     protected_prefixes = (
         tuple(config.get("rrsi", {}).get("protected_prefixes", [])) + ALWAYS_PROTECTED
     )
     protected_paths = _build_protected_paths(cwd_path, protected_prefixes)
 
-    tool_call = payload.get("toolCall") or {}
-    args = tool_call.get("args") or {}
     evo_mode = os.environ.get("RSI_EVOLUTION_MODE") == "1"
     allowed_root_raw = os.environ.get("RSI_ALLOWED_ROOT", "").strip()
     allowed_root = Path(allowed_root_raw) if (evo_mode and allowed_root_raw) else None
 
-    for key in _PATH_ARG_KEYS:
-        val = args.get(key)
-        if isinstance(val, str) and val.strip():
+    for val in event.file_paths:
+        decision = _check_path_against_boundaries(
+            val, cwd_path, protected_paths, allowed_root, evo_mode
+        )
+        if decision is not None:
+            return decision
+
+    for cmd_val in event.commands:
+        write_targets, suspicious = _extract_shell_write_targets(cmd_val)
+        for target in write_targets:
             decision = _check_path_against_boundaries(
-                val, cwd_path, protected_paths, allowed_root, evo_mode
+                target,
+                cwd_path,
+                protected_paths,
+                allowed_root,
+                evo_mode,
+                allow_safe_devices=True,
             )
             if decision is not None:
                 return decision
-
-    for key in _CMD_ARG_KEYS:
-        cmd_val = args.get(key)
-        if isinstance(cmd_val, str) and cmd_val.strip():
-            write_targets, suspicious = _extract_shell_write_targets(cmd_val)
-            for target in write_targets:
-                decision = _check_path_against_boundaries(
-                    target,
-                    cwd_path,
-                    protected_paths,
-                    allowed_root,
-                    evo_mode,
-                    allow_safe_devices=True,
-                )
-                if decision is not None:
-                    return decision
-            if suspicious:
-                normalized_cmd = cmd_val.replace("\\", "/")
-                for clean_prefix, _, _ in protected_paths:
-                    if clean_prefix in normalized_cmd:
-                        return {
-                            "decision": "deny" if evo_mode else "ask",
-                            "reason": (
-                                f"Suspicious shell command referencing protected target ({clean_prefix}). "
-                                "Approve explicitly or use Outer Loop evolution mode."
-                            ),
-                        }
+        if suspicious:
+            normalized_cmd = cmd_val.replace("\\", "/")
+            for clean_prefix, _, _ in protected_paths:
+                if clean_prefix in normalized_cmd:
+                    return {
+                        "decision": "deny" if evo_mode else "ask",
+                        "reason": (
+                            f"Suspicious shell command referencing protected target ({clean_prefix}). "
+                            "Approve explicitly or use Outer Loop evolution mode."
+                        ),
+                    }
 
     return {"decision": "allow"}
+
+
+def evaluate_tool_guard(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return runtime-formatted PreToolUse decision dict for ``payload``."""
+    event = normalize_pre_tool_event(payload)
+    raw_decision = evaluate_normalized_tool_guard(event)
+    return serialize_hook_response(event.runtime, "pre_tool", raw_decision)
 
 
 def main() -> None:
