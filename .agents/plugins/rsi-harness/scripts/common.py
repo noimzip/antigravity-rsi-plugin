@@ -79,6 +79,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "benchmarks/",
         ],
     },
+    "plugins": {
+        "proposer": None,
+        "evaluator": None,
+        "critic": None,
+    },
 }
 
 

@@ -40,6 +40,16 @@ from budget_and_pruning import (  # noqa: E402
     compute_annealed_budget,
 )
 from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
+from interfaces import (  # noqa: E402
+    BenchmarkEvaluator,
+    Critic,
+    DefaultProposer,
+    Evaluator,
+    ProposalContext,
+    Proposer,
+    RrsiCritic,
+    load_plugin,
+)
 from lineage import LineageArchive  # noqa: E402
 try:
     from run_bench import load_benchmark_suite  # noqa: E402
@@ -604,10 +614,40 @@ def run_evolution_cycle(
     parent_strategy: str = "head",
     parent_node_id: str | None = None,
     seed: int | None = None,
+    proposer: Proposer | str | dict[str, Any] | None = None,
+    evaluator: Evaluator | str | dict[str, Any] | None = None,
+    critic: Critic | str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
     config = load_rsi_config(repo)
+    plugin_cfg = config.get("plugins") if isinstance(config.get("plugins"), dict) else {}
+    active_proposer = load_plugin(
+        proposer if proposer is not None else plugin_cfg.get("proposer"),
+        Proposer,
+        DefaultProposer,
+        entry_point_group="rsi_harness.proposers",
+        search_paths=[repo],
+    )
+    active_evaluator = load_plugin(
+        evaluator if evaluator is not None else plugin_cfg.get("evaluator"),
+        Evaluator,
+        BenchmarkEvaluator,
+        entry_point_group="rsi_harness.evaluators",
+        search_paths=[repo],
+    )
+    active_critic = load_plugin(
+        critic if critic is not None else plugin_cfg.get("critic"),
+        Critic,
+        RrsiCritic,
+        entry_point_group="rsi_harness.critics",
+        search_paths=[repo],
+    )
+    plugins_used = {
+        "proposer": f"{type(active_proposer).__module__}.{type(active_proposer).__qualname__}",
+        "evaluator": f"{type(active_evaluator).__module__}.{type(active_evaluator).__qualname__}",
+        "critic": f"{type(active_critic).__module__}.{type(active_critic).__qualname__}",
+    }
     rrsi_cfg = config.get("rrsi", {})
     n_trials = max(1, int(rrsi_cfg.get("n_trials", 1)))
     max_ood_reg = float(rrsi_cfg.get("max_ood_regression", 0.05))
@@ -691,9 +731,10 @@ def run_evolution_cycle(
 
         if has_holdout:
             # Proposer sees ONLY train traces; holdout & OOD stay completely isolated.
-            train_baseline = _run_bench_in_repo(
+            train_baseline = active_evaluator.evaluate(
                 worktree_dir,
                 runner=runner,
+                config=config,
                 trace_export_dir=wt_traces_dir,
                 n_trials=n_trials,
                 sandbox=sandbox,
@@ -702,9 +743,10 @@ def run_evolution_cycle(
             )
             if wt_traces_dir.is_dir():
                 shutil.copytree(wt_traces_dir, repo / ".rsi" / "traces", dirs_exist_ok=True)
-            baseline_report = _run_bench_in_repo(
+            baseline_report = active_evaluator.evaluate(
                 worktree_dir,
                 runner=runner,
+                config=config,
                 trace_export_dir=None,
                 n_trials=n_trials,
                 sandbox=sandbox,
@@ -712,9 +754,10 @@ def run_evolution_cycle(
                 split="holdout",
             )
             if has_ood:
-                ood_baseline = _run_bench_in_repo(
+                ood_baseline = active_evaluator.evaluate(
                     worktree_dir,
                     runner=runner,
+                    config=config,
                     trace_export_dir=None,
                     n_trials=n_trials,
                     sandbox=sandbox,
@@ -722,9 +765,10 @@ def run_evolution_cycle(
                     split="ood",
                 )
         else:
-            baseline_report = _run_bench_in_repo(
+            baseline_report = active_evaluator.evaluate(
                 worktree_dir,
                 runner=runner,
+                config=config,
                 trace_export_dir=wt_traces_dir,
                 n_trials=n_trials,
                 sandbox=sandbox,
@@ -744,24 +788,28 @@ def run_evolution_cycle(
 
         trace_ctx = _collect_trace_context(worktree_dir)
 
-        if runner == "mock":
-            proposer_note = _mock_propose(
-                worktree_dir, trace_ctx, history, override_mode=mock_bad_proposal, config=config
+        proposer_note = active_proposer.propose(
+            ProposalContext(
+                repo_root=repo,
+                worktree_dir=worktree_dir,
+                runner=runner,
+                trace_context=trace_ctx,
+                history=history,
+                config=config,
+                mock_bad_proposal=mock_bad_proposal,
+                parent_node_id=parent_node.node_id,
             )
-        elif runner == "agy":
-            proposer_note = _agy_propose(worktree_dir, trace_ctx, history, config=config)
-        else:
-            proposer_note = _runtime_propose(runner, worktree_dir, trace_ctx, history, config=config)
+        )
 
         pruning_analysis = analyze_pruning_candidates(worktree_dir, config, history)
         pruned_files = apply_pruning_pass(worktree_dir, pruning_analysis) if prune else []
 
-        prop_ok, prop_reasons, prop_meta = validate_proposal_rrsi(
+        prop_ok, prop_reasons, prop_meta = active_critic.check(
             worktree_dir,
-            base_sha,
-            config,
-            history,
-            benchmark_ids,
+            base_sha=base_sha,
+            config=config,
+            history=history,
+            benchmark_ids=benchmark_ids,
             leakage_profile=leakage_profile,
         )
         prop_meta["pruning_analysis"] = pruning_analysis
@@ -802,6 +850,7 @@ def run_evolution_cycle(
                 "lineage_node_id": None,
                 "node_branch": None,
                 "pareto_frontier_ids": pareto_ids,
+                "plugins_used": plugins_used,
                 "accepted": False,
                 "stage": "proposal_critic",
                 "reasons": prop_reasons,
@@ -819,9 +868,10 @@ def run_evolution_cycle(
             return record
 
         cand_traces_dir = worktree_dir / ".rsi" / "cand_traces"
-        candidate_report = _run_bench_in_repo(
+        candidate_report = active_evaluator.evaluate(
             worktree_dir,
             runner=runner,
+            config=config,
             trace_export_dir=cand_traces_dir,
             n_trials=n_trials,
             sandbox=sandbox,
@@ -833,9 +883,10 @@ def run_evolution_cycle(
         sel_reasons = list(sel_diag["reasons"])
 
         if sel_ok and has_ood and ood_baseline is not None:
-            ood_candidate = _run_bench_in_repo(
+            ood_candidate = active_evaluator.evaluate(
                 worktree_dir,
                 runner=runner,
+                config=config,
                 trace_export_dir=None,
                 n_trials=n_trials,
                 sandbox=sandbox,
@@ -937,6 +988,7 @@ def run_evolution_cycle(
             "lineage_node_id": lineage_node_id,
             "node_branch": node_branch,
             "pareto_frontier_ids": pareto_ids,
+            "plugins_used": plugins_used,
             "accepted": sel_ok,
             "commit_sha": commit_sha,
             "stage": "selection_gate",
