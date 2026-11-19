@@ -27,6 +27,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+from adapters.runtime import get_runtime_adapter, list_runtime_adapters  # noqa: E402
 from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
 
 
@@ -132,12 +133,14 @@ def _seed_worktree_traces(repo: Path, worktree: Path) -> None:
         shutil.copy2(src_history, dst_history)
 
 
-def _agy_propose(worktree: Path, trace_ctx: dict[str, Any], history: list[dict[str, Any]]) -> str:
-    """Invoke Antigravity CLI as Meta-Harness Proposer inside ``worktree``."""
-    resolved_wt = worktree.resolve()
+def _build_proposer_prompt(
+    resolved_wt: Path,
+    trace_ctx: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> str:
     history_tail = json.dumps(history[-5:], ensure_ascii=False)
     trace_summary = json.dumps(trace_ctx, ensure_ascii=False)
-    prompt = (
+    return (
         f"You are a Meta-Harness Proposer working ONLY inside worktree `{resolved_wt}`.\n"
         f"Target files you may edit: `{resolved_wt}/.agents/plugins/rsi-harness/rules/AGENTS.md` "
         f"or `{resolved_wt}/.agents/plugins/rsi-harness/skills/*/SKILL.md`.\n"
@@ -151,18 +154,39 @@ def _agy_propose(worktree: Path, trace_ctx: dict[str, Any], history: list[dict[s
         f"Recent evolution history (avoid failed hypotheses): {history_tail}\n"
         f"Inspect `{resolved_wt}/.rsi/traces/` if present, then make one concise improvement inside `{resolved_wt}`."
     )
-    env = dict(os.environ)
-    env["RSI_EVOLUTION_MODE"] = "1"
-    env["RSI_ALLOWED_ROOT"] = str(resolved_wt)
-    proc = subprocess.run(
-        ["agy", "-p", prompt, "--dangerously-skip-permissions", "--output-format", "json"],
-        cwd=str(resolved_wt),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
+
+
+def _runtime_propose(
+    runner: str,
+    worktree: Path,
+    trace_ctx: dict[str, Any],
+    history: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Invoke configured runtime adapter as Meta-Harness Proposer inside ``worktree``."""
+    resolved_wt = worktree.resolve()
+    prompt = _build_proposer_prompt(resolved_wt, trace_ctx, history)
+    runtime_cfg = (config or {}).get("runtime") if isinstance((config or {}).get("runtime"), dict) else {}
+    adapter = get_runtime_adapter(runner, runtime_cfg)
+    timeout_sec = int(runtime_cfg.get("proposer_timeout_sec", 180))
+    res = adapter.run(
+        prompt,
+        resolved_wt,
+        timeout_sec=timeout_sec,
+        evolution_mode=True,
+        allowed_root=resolved_wt,
     )
-    return (proc.stdout or proc.stderr or "agy proposer finished")[:400]
+    return (res.raw_output or res.stderr or f"{runner} proposer finished")[:400]
+
+
+def _agy_propose(
+    worktree: Path,
+    trace_ctx: dict[str, Any],
+    history: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Invoke Antigravity CLI as Meta-Harness Proposer inside ``worktree``."""
+    return _runtime_propose("agy", worktree, trace_ctx, history, config=config)
 
 
 def validate_proposal_rrsi(
@@ -441,8 +465,10 @@ def run_evolution_cycle(
             proposer_note = _mock_propose(
                 worktree_dir, trace_ctx, history, override_mode=mock_bad_proposal
             )
+        elif runner == "agy":
+            proposer_note = _agy_propose(worktree_dir, trace_ctx, history, config=config)
         else:
-            proposer_note = _agy_propose(worktree_dir, trace_ctx, history)
+            proposer_note = _runtime_propose(runner, worktree_dir, trace_ctx, history, config=config)
 
         prop_ok, prop_reasons, prop_meta = validate_proposal_rrsi(
             worktree_dir, base_sha, config, history, benchmark_ids
@@ -509,7 +535,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one RSI-Harness outer evolution cycle.")
     parser.add_argument("--repo", default=".", help="Target repository path")
     parser.add_argument("--branch", default="rsi/evolved", help="Branch to auto-apply winning edits")
-    parser.add_argument("--runner", default="mock", choices=["mock", "agy"])
+    parser.add_argument("--runner", default="mock", choices=["mock", *list_runtime_adapters()])
     parser.add_argument(
         "--mock-bad-proposal",
         default=None,

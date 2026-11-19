@@ -2,6 +2,15 @@
   "inner_check_cmd": "python3 -m unittest discover -s tests",
   "max_inner_retries": 2,
   "evidence_max_chars": 10000,
+  "runtime": {
+    "default": "agy",
+    "model": null,
+    "timeout_sec": 120,
+    "extra_args": [],
+    "pty": {
+      "command": null
+    }
+  },
   "rrsi": {
     "max_files": 2,
     "max_diff_lines": 80,

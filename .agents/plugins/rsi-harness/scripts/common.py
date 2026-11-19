@@ -19,6 +19,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "api_key_env": "",
         "timeout_sec": 15,
     },
+    "runtime": {
+        "default": "agy",
+        "model": None,
+        "timeout_sec": 120,
+        "extra_args": [],
+        "pty": {"command": None},
+    },
     "rrsi": {
         "max_files": 2,
         "max_diff_lines": 80,

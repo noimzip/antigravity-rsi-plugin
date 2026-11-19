@@ -9,10 +9,18 @@ import math
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / ".agents" / "plugins" / "rsi-harness" / "scripts"
+if _SCRIPTS_DIR.is_dir() and str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from adapters.runtime import AgyAdapter, get_runtime_adapter, list_runtime_adapters  # noqa: E402
+from common import load_rsi_config  # noqa: E402
 
 
 def _load_rules_text(repo_root: Path) -> str:
@@ -112,38 +120,30 @@ def _apply_mock_solution(task_id: str, task_dir: Path, rules_text: str) -> tuple
     return 1500 + extra_tokens, "mock_unknown"
 
 
-def _run_agy_task(prompt: str, task_dir: Path, timeout_sec: int = 120) -> tuple[int, str]:
-    cmd = [
-        "agy",
-        "-p",
-        prompt,
-        "--dangerously-skip-permissions",
-        "--output-format",
-        "json",
-    ]
-    proc = subprocess.run(
-        cmd,
-        cwd=str(task_dir),
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
-    )
-    tokens = 0
-    raw = (proc.stdout or "").strip()
-    if raw:
-        try:
-            data = json.loads(raw)
-            usage = data.get("usage") or {}
-            tokens = int(
-                usage.get("total_tokens")
-                or (
-                    int(usage.get("input_tokens", 0))
-                    + int(usage.get("output_tokens", 0))
-                )
-            )
-        except (ValueError, json.JSONDecodeError, TypeError):
-            pass
-    return tokens, raw[:500]
+def _run_agy_task(
+    prompt: str,
+    task_dir: Path,
+    timeout_sec: int = 120,
+    runtime_config: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    res = AgyAdapter(runtime_config).run(prompt, task_dir, timeout_sec=timeout_sec)
+    return res.total_tokens, res.raw_output[:500]
+
+
+def _run_adapter_task(
+    runner: str,
+    prompt: str,
+    task_dir: Path,
+    *,
+    runtime_config: dict[str, Any] | None = None,
+    timeout_sec: int = 120,
+) -> tuple[int, str]:
+    eff_timeout = int((runtime_config or {}).get("timeout_sec", timeout_sec))
+    if runner == "agy" and not runtime_config:
+        return _run_agy_task(prompt, task_dir, timeout_sec=eff_timeout)
+    adapter = get_runtime_adapter(runner, runtime_config)
+    res = adapter.run(prompt, task_dir, timeout_sec=eff_timeout)
+    return res.total_tokens, (res.raw_output or res.stderr)[:500]
 
 
 def summarize_series(values: list[float]) -> dict[str, float]:
@@ -269,6 +269,7 @@ def _run_single_trial(
     trace_export_dir: Path | None,
     trial_idx: int,
     n_trials: int,
+    runtime_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     passed_count = 0
@@ -285,7 +286,12 @@ def _run_single_trial(
             if runner == "mock":
                 tokens, note = _apply_mock_solution(task_id, task_dir, rules_text)
             else:
-                tokens, note = _run_agy_task(task["prompt"], task_dir)
+                tokens, note = _run_adapter_task(
+                    runner,
+                    task["prompt"],
+                    task_dir,
+                    runtime_config=runtime_config,
+                )
 
             grade = subprocess.run(
                 ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
@@ -346,6 +352,8 @@ def run_benchmark(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     rules_text = _load_rules_text(repo_root)
     tasks = manifest.get("tasks", [])
+    cfg = load_rsi_config(repo_root)
+    runtime_config = cfg.get("runtime") if isinstance(cfg.get("runtime"), dict) else None
 
     trials: list[dict[str, Any]] = []
     for trial_idx in range(1, n_trials + 1):
@@ -358,6 +366,7 @@ def run_benchmark(
                 trace_export_dir,
                 trial_idx=trial_idx,
                 n_trials=n_trials,
+                runtime_config=runtime_config,
             )
         )
 
@@ -383,7 +392,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run RSI-Harness mini benchmark.")
     parser.add_argument("--repo", default=".", help="Repository root containing candidate harness")
     parser.add_argument("--manifest", default="benchmarks/tasks.json", help="Benchmark tasks JSON")
-    parser.add_argument("--runner", default="mock", choices=["mock", "agy"])
+    parser.add_argument(
+        "--runner",
+        default="mock",
+        choices=["mock", *list_runtime_adapters()],
+    )
     parser.add_argument(
         "--trials",
         type=int,
