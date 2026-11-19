@@ -104,6 +104,142 @@ class GuardHarnessTests(unittest.TestCase):
             os.environ.pop("RSI_EVOLUTION_MODE", None)
             os.environ.pop("RSI_ALLOWED_ROOT", None)
 
+    def test_relative_traversal_and_non_prefix_names(self) -> None:
+        os.environ.pop("RSI_EVOLUTION_MODE", None)
+        for rel in (
+            "src/../benchmarks/tasks.json",
+            ".agents/plugins/rsi-harness/rules/../hooks.json",
+            ".agents/plugins/rsi-harness/skills/../scripts/common.py",
+        ):
+            res = evaluate_tool_guard(
+                {
+                    "cwd": str(REPO_ROOT),
+                    "toolCall": {"name": "edit_file", "args": {"Path": rel}},
+                }
+            )
+            self.assertEqual(res["decision"], "ask", msg=f"Expected ask for {rel}: {res}")
+
+        # Similar-prefix paths outside protected directories must not be falsely blocked
+        res_sibling = evaluate_tool_guard(
+            {
+                "cwd": str(REPO_ROOT),
+                "toolCall": {"name": "write_file", "args": {"Path": "benchmarks_notes/readme.md"}},
+            }
+        )
+        self.assertEqual(res_sibling["decision"], "allow")
+
+    def test_symlink_escape_blocked_in_file_and_shell_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            outside = root / "outside"
+            outside.mkdir(parents=True)
+            (outside / "secret.txt").write_text("topsecret", encoding="utf-8")
+
+            rules_dir = repo / ".agents" / "plugins" / "rsi-harness" / "rules"
+            bench_dir = repo / "benchmarks"
+            rules_dir.mkdir(parents=True)
+            bench_dir.mkdir(parents=True)
+            (bench_dir / "tasks.json").write_text("{}", encoding="utf-8")
+            (repo / ".agents" / "plugins" / "rsi-harness" / "hooks.json").write_text("{}", encoding="utf-8")
+
+            link_to_bench = rules_dir / "bench_link.json"
+            link_to_bench.symlink_to(bench_dir / "tasks.json")
+            link_to_outside = rules_dir / "outside_link.txt"
+            link_to_outside.symlink_to(outside / "secret.txt")
+
+            # Normal mode: symlink into benchmarks -> ask
+            os.environ.pop("RSI_EVOLUTION_MODE", None)
+            res_norm = evaluate_tool_guard(
+                {
+                    "cwd": str(repo),
+                    "toolCall": {"name": "write_file", "args": {"Path": str(link_to_bench)}},
+                }
+            )
+            self.assertEqual(res_norm["decision"], "ask")
+
+            # Evolution mode: symlink to protected OR symlink outside allowed_root -> deny
+            os.environ["RSI_EVOLUTION_MODE"] = "1"
+            os.environ["RSI_ALLOWED_ROOT"] = str(repo)
+            try:
+                res_evo_bench = evaluate_tool_guard(
+                    {
+                        "cwd": str(repo),
+                        "toolCall": {"name": "edit_file", "args": {"Path": str(link_to_bench)}},
+                    }
+                )
+                self.assertEqual(res_evo_bench["decision"], "deny")
+
+                res_evo_out = evaluate_tool_guard(
+                    {
+                        "cwd": str(repo),
+                        "toolCall": {"name": "write_file", "args": {"Path": str(link_to_outside)}},
+                    }
+                )
+                self.assertEqual(res_evo_out["decision"], "deny")
+
+                res_shell_link = evaluate_tool_guard(
+                    {
+                        "cwd": str(repo),
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "echo hacked > .agents/plugins/rsi-harness/rules/bench_link.json"
+                            },
+                        },
+                    }
+                )
+                self.assertEqual(res_shell_link["decision"], "deny")
+            finally:
+                os.environ.pop("RSI_EVOLUTION_MODE", None)
+                os.environ.pop("RSI_ALLOWED_ROOT", None)
+
+    def test_shell_redirects_mutating_and_readonly_commands(self) -> None:
+        mutating_cmds = [
+            "echo x > benchmarks/tasks.json",
+            "cat a >> .agents/plugins/rsi-harness/hooks.json",
+            "echo x | tee .agents/plugins/rsi-harness/scripts/common.py",
+            'sh -c "echo x > benchmarks/tasks.json"',
+            "rm benchmarks/tasks.json",
+            "mv benchmarks/tasks.json tmp.json",
+            "cp src/tasklib.py benchmarks/tasks.json",
+            "sed -i 's/a/b/' benchmarks/tasks.json",
+            "python3 -c \"open('benchmarks/tasks.json','w').write('{}')\"",
+            "echo $(echo x > benchmarks/tasks.json)",
+        ]
+        os.environ["RSI_EVOLUTION_MODE"] = "1"
+        os.environ["RSI_ALLOWED_ROOT"] = str(REPO_ROOT)
+        try:
+            for cmd in mutating_cmds:
+                res = evaluate_tool_guard(
+                    {
+                        "cwd": str(REPO_ROOT),
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                    }
+                )
+                self.assertEqual(res["decision"], "deny", msg=f"Expected deny for: {cmd} -> {res}")
+
+            readonly_cmds = [
+                "cat .agents/plugins/rsi-harness/scripts/guard_harness.py",
+                "grep -n foo .agents/plugins/rsi-harness/scripts/common.py",
+                "ls -la benchmarks/",
+                "sed -n '1,5p' benchmarks/run_bench.py",
+                "python3 -m unittest discover -s .agents/plugins/rsi-harness/tests",
+                "git diff benchmarks/run_bench.py",
+                "ls -la benchmarks/ 2>/dev/null",
+            ]
+            for cmd in readonly_cmds:
+                res = evaluate_tool_guard(
+                    {
+                        "cwd": str(REPO_ROOT),
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                    }
+                )
+                self.assertEqual(res["decision"], "allow", msg=f"False block for: {cmd} -> {res}")
+        finally:
+            os.environ.pop("RSI_EVOLUTION_MODE", None)
+            os.environ.pop("RSI_ALLOWED_ROOT", None)
+
 
 class EvidenceReducerTests(unittest.TestCase):
     def test_short_log_passes_through(self) -> None:
