@@ -58,6 +58,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_ood_regression": 0.05,
         "enforce_anti_goodhart": True,
         "max_rules_bytes": 24000,
+        "annealing": {
+            "enabled": True,
+            "decay_rate": 0.85,
+            "saturation_decay": 0.9,
+            "min_files": 1,
+            "min_diff_lines": 15,
+        },
+        "pruning": {
+            "jaccard_threshold": 0.75,
+            "warn_ratio": 0.75,
+        },
         "editable_prefixes": [
             ".agents/plugins/rsi-harness/rules/",
             ".agents/plugins/rsi-harness/skills/",

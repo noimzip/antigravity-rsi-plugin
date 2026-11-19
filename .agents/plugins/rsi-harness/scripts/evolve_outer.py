@@ -34,6 +34,11 @@ if BENCHMARKS_DIR.is_dir() and str(BENCHMARKS_DIR) not in sys.path:
 
 from adapters.runtime import get_runtime_adapter, list_runtime_adapters  # noqa: E402
 from adapters.sandbox import SandboxAdapter, get_sandbox_adapter  # noqa: E402
+from budget_and_pruning import (  # noqa: E402
+    analyze_pruning_candidates,
+    apply_pruning_pass,
+    compute_annealed_budget,
+)
 from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
 try:
     from run_bench import load_benchmark_suite  # noqa: E402
@@ -304,9 +309,9 @@ def validate_proposal_rrsi(
     leakage_profile: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """Enforce RRSI Proposal-Side Regularization & Critic Leakage/Budget Screening."""
-    rrsi = config.get("rrsi", {})
-    max_files = int(rrsi.get("max_files", 2))
-    max_diff_lines = int(rrsi.get("max_diff_lines", 80))
+    annealed = compute_annealed_budget(config, history)
+    max_files = int(annealed["max_files"])
+    max_diff_lines = int(annealed["max_diff_lines"])
     surface = resolve_mutable_surface(worktree, config)
 
     status_out = _git(worktree, "status", "--porcelain").stdout.splitlines()
@@ -396,6 +401,7 @@ def validate_proposal_rrsi(
         "diff_hash": diff_hash,
         "rules_bytes": rules_bytes,
         "surface_bytes": surface_bytes,
+        "effective_budget": annealed,
         "pruning_recommended": rules_bytes > int(surface.total_max_bytes * 0.75),
     }
     return len(reasons) == 0, reasons, meta
@@ -588,6 +594,7 @@ def run_evolution_cycle(
     mock_bad_proposal: str | None = None,
     manifest_path: Path | None = None,
     mode: str = "auto",
+    prune: bool = False,
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
@@ -710,6 +717,9 @@ def run_evolution_cycle(
         else:
             proposer_note = _runtime_propose(runner, worktree_dir, trace_ctx, history, config=config)
 
+        pruning_analysis = analyze_pruning_candidates(worktree_dir, config, history)
+        pruned_files = apply_pruning_pass(worktree_dir, pruning_analysis) if prune else []
+
         prop_ok, prop_reasons, prop_meta = validate_proposal_rrsi(
             worktree_dir,
             base_sha,
@@ -718,6 +728,8 @@ def run_evolution_cycle(
             benchmark_ids,
             leakage_profile=leakage_profile,
         )
+        prop_meta["pruning_analysis"] = pruning_analysis
+        prop_meta["pruned_files"] = pruned_files
         store = TraceStore(repo)
         diff_text = _git(worktree_dir, "diff", base_sha).stdout
 
@@ -874,6 +886,11 @@ def main() -> None:
         help="Evolution mode: auto (falls back to trace-mined if tasks.json absent), benchmark, or trace-mined",
     )
     parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Run structural pruning pass to remove redundant rules inside candidate worktree",
+    )
+    parser.add_argument(
         "--mock-bad-proposal",
         default=None,
         choices=["leak", "budget", "protected"],
@@ -888,6 +905,7 @@ def main() -> None:
         mock_bad_proposal=args.mock_bad_proposal,
         manifest_path=Path(args.manifest) if args.manifest else None,
         mode=args.mode,
+        prune=args.prune,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

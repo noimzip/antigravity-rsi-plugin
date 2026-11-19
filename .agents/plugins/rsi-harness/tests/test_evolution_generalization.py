@@ -20,7 +20,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(REPO_ROOT / "benchmarks") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
 
+from action_fusion import run_fused_edit_and_check  # noqa: E402
+from budget_and_pruning import (  # noqa: E402
+    analyze_pruning_candidates,
+    apply_pruning_pass,
+    compute_annealed_budget,
+)
 from common import append_jsonl, load_rsi_config  # noqa: E402
+from context_compact import compact_subtask_context, evaluate_compact_hook  # noqa: E402
 from evolve_outer import run_evolution_cycle, validate_proposal_rrsi  # noqa: E402
 from guard_harness import evaluate_tool_guard  # noqa: E402
 from surface import parse_simple_yaml, resolve_mutable_surface  # noqa: E402
@@ -212,6 +219,139 @@ mutable_surface:
                 subprocess.check_output(["git", "rev-parse", "main"], cwd=repo, text=True).strip(),
                 main_before,
             )
+
+
+class BudgetPruningFusionCompactTests(unittest.TestCase):
+    def test_annealed_edit_budget_decays_and_respects_floors(self) -> None:
+        cfg = {
+            "rrsi": {
+                "max_files": 4,
+                "max_diff_lines": 100,
+                "annealing": {
+                    "enabled": True,
+                    "decay_rate": 0.8,
+                    "saturation_decay": 0.85,
+                    "min_files": 1,
+                    "min_diff_lines": 20,
+                },
+            }
+        }
+        b0 = compute_annealed_budget(cfg, [])
+        b1 = compute_annealed_budget(cfg, [{"accepted": True}])
+        b2 = compute_annealed_budget(cfg, [{"accepted": True}, {"accepted": True}, {"accepted": False}])
+        b_floor = compute_annealed_budget(cfg, [{"accepted": True}] * 25)
+
+        self.assertEqual(b0["max_diff_lines"], 100)
+        self.assertEqual(b0["max_files"], 4)
+        self.assertLess(b1["max_diff_lines"], b0["max_diff_lines"])
+        self.assertLess(b2["max_diff_lines"], b1["max_diff_lines"])
+        self.assertEqual(b_floor["max_files"], 1)
+        self.assertEqual(b_floor["max_diff_lines"], 20)
+
+    def test_structural_pruning_removes_duplicate_rules_and_flags_dead_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "prune_repo"
+            (repo / "skills" / "unused-helper").mkdir(parents=True)
+            (repo / "skills" / "unused-helper" / "SKILL.md").write_text("# Unused Helper\n", encoding="utf-8")
+            (repo / "AGENTS.md").write_text(
+                "# Rules\n"
+                "- Validate empty input and zero boundary conditions before returning results.\n"
+                "- Run unit tests after editing source modules.\n"
+                "- Validate empty input and zero boundary conditions before returning results!\n",
+                encoding="utf-8",
+            )
+            (repo / "harness.yaml").write_text(
+                """
+mutable_surface:
+  - path: "AGENTS.md"
+    role: "rules"
+  - path: "skills/*/SKILL.md"
+    role: "skills"
+""",
+                encoding="utf-8",
+            )
+            sess = repo / ".rsi" / "traces" / "s1"
+            sess.mkdir(parents=True)
+            (sess / "summary.json").write_text(json.dumps({"conversationId": "s1", "total_tokens": 500}), encoding="utf-8")
+
+            cfg = load_rsi_config(repo)
+            analysis = analyze_pruning_candidates(repo, cfg, [])
+            self.assertEqual(len(analysis["redundant_rules"]), 1)
+            self.assertEqual(len(analysis["dead_skills"]), 1)
+            self.assertEqual(analysis["dead_skills"][0]["skill"], "unused-helper")
+            self.assertGreater(analysis["estimated_bytes_saved"], 0)
+            self.assertTrue(analysis["should_prune"])
+
+            before_bytes = (repo / "AGENTS.md").stat().st_size
+            modified = apply_pruning_pass(repo, analysis)
+            self.assertEqual(modified, ["AGENTS.md"])
+            after_bytes = (repo / "AGENTS.md").stat().st_size
+            self.assertLess(after_bytes, before_bytes)
+
+    def test_action_fusion_multi_edit_check_and_syntax_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "fusion_repo"
+            (repo / "src").mkdir(parents=True)
+            (repo / "tests").mkdir(parents=True)
+            (repo / "src" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "a.py").write_text("def f(x: int) -> int:\n    return x\n", encoding="utf-8")
+            (repo / "src" / "b.py").write_text("def g(x: int) -> int:\n    return x\n", encoding="utf-8")
+            (repo / "tests" / "test_ab.py").write_text(
+                "import unittest\nfrom src.a import f\nfrom src.b import g\n\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_fg(self):\n"
+                "        self.assertEqual(f(3), 6)\n"
+                "        self.assertEqual(g(3), 9)\n",
+                encoding="utf-8",
+            )
+
+            # Syntax error triggers clean atomic rollback
+            bad_res = run_fused_edit_and_check(
+                repo,
+                [{"path": "src/a.py", "content": "def broken(:\n"}],
+            )
+            self.assertFalse(bad_res["ok"])
+            self.assertTrue(bad_res["rolled_back"])
+            self.assertEqual(len(bad_res["syntax_errors"]), 1)
+            self.assertIn("return x", (repo / "src" / "a.py").read_text(encoding="utf-8"))
+
+            # Valid multi-file edit + test in 1 round-trip
+            ok_res = run_fused_edit_and_check(
+                repo,
+                [
+                    {"path": "src/a.py", "target": "return x", "replacement": "return x * 2"},
+                    {"path": "src/b.py", "target": "return x", "replacement": "return x * 3"},
+                ],
+                check_cmd="python3 -m unittest discover -s tests",
+            )
+            self.assertTrue(ok_res["ok"], msg=str(ok_res))
+            self.assertEqual(ok_res["fused_roundtrips"], 1)
+            self.assertEqual(ok_res["roundtrips_saved"], 2)
+            self.assertGreater(ok_res["estimated_tokens_saved"], 1000)
+
+    def test_online_context_compact_preserves_errors_and_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            events = []
+            for i in range(18):
+                ev = {
+                    "stepIdx": i,
+                    "event": "post_tool",
+                    "toolName": "read_file" if i % 2 == 0 else "edit_file",
+                    "toolArgs": {"Path": f"src/mod_{i}.py", "padding": "X" * 240},
+                    "error": "ValueError: invalid bound" if i == 4 else None,
+                    "artifactRef": ".rsi/artifacts/c1/step_4.json" if i == 4 else None,
+                }
+                events.append(ev)
+                append_jsonl(cwd / ".rsi" / "traces" / "c1" / "events.jsonl", ev)
+
+            res = evaluate_compact_hook({"cwd": str(cwd), "conversationId": "c1"}, max_keep_recent=4)
+            self.assertGreater(res["reduction_ratio"], 0.3)
+            self.assertGreater(res["estimated_tokens_saved"], 0)
+            self.assertIn("ValueError: invalid bound", res["preserved_errors"])
+            self.assertIn(".rsi/artifacts/c1/step_4.json", res["preserved_artifacts"])
+            self.assertIn("src/mod_4.py", res["preserved_files"])
+            self.assertTrue((cwd / ".rsi" / "traces" / "c1" / "compacted_context.json").is_file())
 
 
 if __name__ == "__main__":
