@@ -40,6 +40,7 @@ from budget_and_pruning import (  # noqa: E402
     compute_annealed_budget,
 )
 from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
+from lineage import LineageArchive  # noqa: E402
 try:
     from run_bench import load_benchmark_suite  # noqa: E402
 except ImportError:
@@ -128,19 +129,24 @@ def _mock_propose(
         return "Injected protected file edit for testing guard"
 
     seen_hashes = {h.get("diff_hash") for h in history}
-    addition = (
-        "\n- 文字列パースやログ解析では空行・境界・分割数を検証し、"
-        "編集後は必ず unittest を再実行して既存の公開関数・型注釈・定数仕様を維持すること。\n"
-    )
-    candidate_text = current.rstrip() + addition
-    candidate_hash = hashlib.sha256(addition.encode("utf-8")).hexdigest()[:12]
-    if candidate_hash in seen_hashes:
-        addition = (
-            "\n- エラー再現時は失敗行周辺のみを確認し、公開インターフェースを変えずに最小差分で修正後にテストを実行すること。\n"
-        )
+    additions = [
+        (
+            "\n- 文字列パースやログ解析では空行・境界・分割数を検証し、"
+            "編集後は必ず unittest を再実行して既存の公開関数・型注釈・定数仕様を維持すること。\n"
+        ),
+        (
+            "\n- ログ調査時は失敗行周辺と境界条件を検証し、"
+            "公開インターフェースを変えずに最小差分で修正後に再実行すること。\n"
+        ),
+    ]
+    for addition in additions:
         candidate_text = current.rstrip() + addition
+        rules_path.write_text(candidate_text, encoding="utf-8")
+        diff_probe = _git(worktree, "diff", check=False).stdout
+        candidate_hash = hashlib.sha256(diff_probe.encode("utf-8")).hexdigest()[:16]
+        if candidate_hash not in seen_hashes:
+            break
 
-    rules_path.write_text(candidate_text, encoding="utf-8")
     return (
         f"Propose generalized post-edit verification & parsing rule "
         f"(traces={len(trace_ctx['summaries'])}, errors={len(trace_ctx['error_samples'])})"
@@ -595,6 +601,9 @@ def run_evolution_cycle(
     manifest_path: Path | None = None,
     mode: str = "auto",
     prune: bool = False,
+    parent_strategy: str = "head",
+    parent_node_id: str | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
@@ -650,7 +659,25 @@ def run_evolution_cycle(
         else ("train_holdout" if has_holdout else "single")
     )
 
-    base_sha = _ensure_branch(repo, branch)
+    head_sha = _ensure_branch(repo, branch)
+    archive = LineageArchive.load(repo)
+    repo_head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    repo_head_branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() or "main"
+    root_node = archive.ensure_root(commit_sha=repo_head_sha, branch=repo_head_branch)
+
+    if parent_node_id is not None:
+        selected_parent = archive.get_node(parent_node_id)
+        if selected_parent is None:
+            raise ValueError(f"Unknown parent_node_id: {parent_node_id}")
+        parent_node = selected_parent
+        base_sha = parent_node.commit_sha or head_sha
+    elif parent_strategy != "head":
+        parent_node = archive.sample_parent(strategy=parent_strategy, seed=seed) or root_node
+        base_sha = parent_node.commit_sha or head_sha
+    else:
+        matching = [n for n in archive.nodes.values() if n.commit_sha == head_sha]
+        parent_node = matching[-1] if matching else root_node
+        base_sha = head_sha
 
     run_id = uuid.uuid4().hex[:8]
     sandbox = get_sandbox_adapter(config)
@@ -706,6 +733,15 @@ def run_evolution_cycle(
             if wt_traces_dir.is_dir():
                 shutil.copytree(wt_traces_dir, repo / ".rsi" / "traces", dirs_exist_ok=True)
 
+        if root_node.metadata.get("metrics_initialized") is not True and parent_node.commit_sha == root_node.commit_sha:
+            root_node.pass_rate = float(baseline_report.get("pass_rate", 0.0))
+            root_node.total_tokens = float(baseline_report.get("total_tokens", 0.0))
+            root_node.latency_ms = float(
+                baseline_report.get("latency_ms", float(baseline_report.get("duration_sec", 0.0)) * 1000.0)
+            )
+            root_node.metadata["metrics_initialized"] = True
+            archive.recompute_novelty()
+
         trace_ctx = _collect_trace_context(worktree_dir)
 
         if runner == "mock":
@@ -734,6 +770,8 @@ def run_evolution_cycle(
         diff_text = _git(worktree_dir, "diff", base_sha).stdout
 
         if not prop_ok:
+            archive.save()
+            pareto_ids = [n.node_id for n in archive.pareto_frontier()]
             gen_rec = store.record_generation(
                 run_id=run_id,
                 branch=branch,
@@ -759,6 +797,11 @@ def run_evolution_cycle(
                 "mined_clusters": mined_clusters,
                 "split_mode": split_mode,
                 "n_trials": n_trials,
+                "parent_strategy": parent_strategy,
+                "parent_node_id": parent_node.node_id,
+                "lineage_node_id": None,
+                "node_branch": None,
+                "pareto_frontier_ids": pareto_ids,
                 "accepted": False,
                 "stage": "proposal_critic",
                 "reasons": prop_reasons,
@@ -814,8 +857,13 @@ def run_evolution_cycle(
                 sel_diag["reasons"] = list(sel_reasons)
 
         commit_sha = None
+        lineage_node_id: str | None = None
+        node_branch: str | None = None
         if sel_ok:
             _git(worktree_dir, "add", "-A")
+            staged_diff = _git(worktree_dir, "diff", "--cached", base_sha).stdout
+            if staged_diff:
+                diff_text = staged_diff
             msg = (
                 f"rsi(evolve): pass_rate {baseline_report['pass_rate']}->"
                 f"{candidate_report['pass_rate']}, tokens {baseline_report['total_tokens']}->"
@@ -823,11 +871,43 @@ def run_evolution_cycle(
             )
             _git(worktree_dir, "commit", "-m", msg)
             commit_sha = _git(worktree_dir, "rev-parse", "HEAD").stdout.strip()
-            _git(repo, "branch", "-f", branch, commit_sha)
+            node_branch = f"rsi/node-{run_id}"
+            _git(repo, "branch", "-f", node_branch, commit_sha)
+            lineage_node_id = f"node-{run_id}"
+            changed_list = sorted(str(p) for p in prop_meta.get("changed_files", []))
+            diff_hash = hashlib.sha256(
+                (diff_text + "\n" + "\n".join(changed_list)).encode("utf-8")
+            ).hexdigest()[:16]
+            cand_latency_ms = float(
+                candidate_report.get("latency_ms", float(candidate_report.get("duration_sec", 0.0)) * 1000.0)
+            )
+            archive.add_node(
+                node_id=lineage_node_id,
+                parent_id=parent_node.node_id,
+                commit_sha=commit_sha,
+                branch=node_branch,
+                pass_rate=float(candidate_report.get("pass_rate", 0.0)),
+                total_tokens=float(candidate_report.get("total_tokens", 0.0)),
+                latency_ms=cand_latency_ms,
+                diff_hash=diff_hash,
+                changed_files=changed_list,
+                metadata={
+                    "run_id": run_id,
+                    "parent_strategy": parent_strategy,
+                    "proposer_note": proposer_note,
+                },
+            )
+            pareto_ids = [n.node_id for n in archive.pareto_frontier()]
+            if parent_strategy == "head" or lineage_node_id in pareto_ids:
+                _git(repo, "branch", "-f", branch, commit_sha)
+        else:
+            pareto_ids = [n.node_id for n in archive.pareto_frontier()]
+
+        archive.save()
 
         gen_rec = store.record_generation(
             run_id=run_id,
-            branch=branch,
+            branch=node_branch or branch,
             parent_sha=base_sha,
             commit_sha=commit_sha,
             accepted=sel_ok,
@@ -852,6 +932,11 @@ def run_evolution_cycle(
             "mined_clusters": mined_clusters,
             "split_mode": split_mode,
             "n_trials": n_trials,
+            "parent_strategy": parent_strategy,
+            "parent_node_id": parent_node.node_id,
+            "lineage_node_id": lineage_node_id,
+            "node_branch": node_branch,
+            "pareto_frontier_ids": pareto_ids,
             "accepted": sel_ok,
             "commit_sha": commit_sha,
             "stage": "selection_gate",
@@ -891,6 +976,23 @@ def main() -> None:
         help="Run structural pruning pass to remove redundant rules inside candidate worktree",
     )
     parser.add_argument(
+        "--parent-strategy",
+        default="head",
+        choices=["head", "dgm", "latest", "best"],
+        help="Parent selection strategy from lineage archive (head preserves branch-head evolution)",
+    )
+    parser.add_argument(
+        "--parent-node-id",
+        default=None,
+        help="Explicit parent lineage node ID to branch from",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional PRNG seed for deterministic DGM parent sampling",
+    )
+    parser.add_argument(
         "--mock-bad-proposal",
         default=None,
         choices=["leak", "budget", "protected"],
@@ -906,6 +1008,9 @@ def main() -> None:
         manifest_path=Path(args.manifest) if args.manifest else None,
         mode=args.mode,
         prune=args.prune,
+        parent_strategy=args.parent_strategy,
+        parent_node_id=args.parent_node_id,
+        seed=args.seed,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
