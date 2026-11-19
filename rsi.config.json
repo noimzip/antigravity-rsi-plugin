@@ -35,6 +35,8 @@
     "max_token_overhead_ratio": 0.15,
     "max_latency_overhead_ratio": 0.25,
     "pareto_tie_epsilon": 0.005,
+    "max_ood_regression": 0.05,
+    "enforce_anti_goodhart": true,
     "max_rules_bytes": 24000,
     "editable_prefixes": [
       ".agents/plugins/rsi-harness/rules/",

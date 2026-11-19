@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,12 +25,20 @@ from pathlib import Path
 from typing import Any
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+BENCHMARKS_DIR = SCRIPTS_DIR.parents[3] / "benchmarks"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+if BENCHMARKS_DIR.is_dir() and str(BENCHMARKS_DIR) not in sys.path:
+    sys.path.insert(0, str(BENCHMARKS_DIR))
 
 from adapters.runtime import get_runtime_adapter, list_runtime_adapters  # noqa: E402
 from adapters.sandbox import SandboxAdapter, get_sandbox_adapter  # noqa: E402
 from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
+try:
+    from run_bench import load_benchmark_suite  # noqa: E402
+except ImportError:
+    def load_benchmark_suite(manifest_or_dir: Path) -> dict[str, Any]:
+        return json.loads(manifest_or_dir.read_text(encoding="utf-8"))
 from trace_store import TraceStore  # noqa: E402
 
 
@@ -188,12 +197,92 @@ def _agy_propose(
     return _runtime_propose("agy", worktree, trace_ctx, history, config=config)
 
 
+_TEST_DEF_RE = re.compile(r"^\s*def\s+(test_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
+_CLASS_DEF_RE = re.compile(r"^\s*class\s+([A-Za-z0-9_]+)\s*(?:\(|:)", re.MULTILINE)
+_ASSERT_LINE_RE = re.compile(r"(?:assert|assertEqual|assertAlmostEqual|assertRaises|expected)")
+
+
+def build_leakage_fingerprint(
+    tasks: list[dict[str, Any]],
+    manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    """Extract task IDs, verifier filenames, hidden identifiers, and assertion hashes."""
+    task_ids: list[str] = []
+    verifier_filenames: set[str] = {"test_solution.py", "run_bench.py", "tasks.json"}
+    if manifest_path is not None:
+        verifier_filenames.add(manifest_path.name)
+
+    hidden_identifiers: set[str] = set()
+    expected_line_hashes: dict[str, str] = {}
+    raw_assertions: list[str] = []
+
+    for task in tasks:
+        tid = task.get("id")
+        if isinstance(tid, str) and tid and tid not in task_ids:
+            task_ids.append(tid)
+
+        split = str(task.get("split", "train")).strip().lower()
+        base_dir = Path(str(task.get("_base_dir") or (manifest_path.parent if manifest_path else ".")))
+        sources_to_scan: list[str] = []
+
+        verifier = task.get("verifier")
+        ro_paths: set[str] = set()
+        if isinstance(verifier, dict):
+            for ro_rel in verifier.get("readonly_paths") or []:
+                ro_str = str(ro_rel)
+                ro_paths.add(ro_str)
+                ro_paths.add(Path(ro_str).name)
+                verifier_filenames.add(Path(ro_str).name)
+            script_rel = verifier.get("script")
+            if isinstance(script_rel, str) and script_rel.strip():
+                verifier_filenames.add(Path(script_rel).name)
+                if split in {"holdout", "ood"}:
+                    sp = Path(script_rel)
+                    if not sp.is_absolute():
+                        sp = (base_dir / sp).resolve()
+                    if sp.is_file():
+                        sources_to_scan.append(sp.read_text(encoding="utf-8", errors="replace"))
+
+        files = task.get("files")
+        if isinstance(files, dict):
+            for rel_name, content in files.items():
+                base_name = Path(str(rel_name)).name
+                is_test_file = base_name.startswith("test_") or base_name.endswith("_test.py")
+                is_ro = str(rel_name) in ro_paths or base_name in ro_paths
+                if is_test_file:
+                    verifier_filenames.add(base_name)
+                if (is_test_file or is_ro) and split in {"holdout", "ood"} and isinstance(content, str):
+                    sources_to_scan.append(content)
+
+        for src_text in sources_to_scan:
+            for ident in _TEST_DEF_RE.findall(src_text):
+                hidden_identifiers.add(ident)
+            for cls_name in _CLASS_DEF_RE.findall(src_text):
+                hidden_identifiers.add(cls_name)
+            for line in src_text.splitlines():
+                stripped = line.strip()
+                if len(stripped) >= 16 and _ASSERT_LINE_RE.search(stripped):
+                    h = hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:16]
+                    expected_line_hashes[h] = stripped
+                    if stripped not in raw_assertions:
+                        raw_assertions.append(stripped)
+
+    return {
+        "task_ids": task_ids,
+        "verifier_filenames": sorted(verifier_filenames),
+        "hidden_identifiers": sorted(hidden_identifiers),
+        "expected_line_hashes": expected_line_hashes,
+        "raw_assertions": raw_assertions,
+    }
+
+
 def validate_proposal_rrsi(
     worktree: Path,
     base_sha: str,
     config: dict[str, Any],
     history: list[dict[str, Any]],
     benchmark_ids: list[str],
+    leakage_profile: dict[str, Any] | None = None,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """Enforce RRSI Proposal-Side Regularization & Critic Leakage/Budget Screening."""
     rrsi = config.get("rrsi", {})
@@ -240,8 +329,16 @@ def validate_proposal_rrsi(
     if diff_hash in seen_accepted_or_rejected:
         reasons.append("duplicate_hypothesis")
 
-    # Critic leakage screen: block benchmark IDs or grading file references.
-    leak_tokens = list(benchmark_ids) + ["test_solution.py", "run_bench.py", "tasks.json"]
+    # Generalized Critic leakage screen: block benchmark IDs, verifier names,
+    # hidden holdout/OOD identifiers, and verbatim expected assertion hashes.
+    profile = leakage_profile or {}
+    leak_tokens = list(
+        dict.fromkeys(
+            list(benchmark_ids)
+            + list(profile.get("task_ids", []))
+            + list(profile.get("verifier_filenames", ["test_solution.py", "run_bench.py", "tasks.json"]))
+        )
+    )
     added_lines = [
         ln[1:] for ln in diff_text.splitlines() if ln.startswith("+") and not ln.startswith("+++")
     ]
@@ -249,6 +346,29 @@ def validate_proposal_rrsi(
     for token in leak_tokens:
         if token in added_blob:
             reasons.append(f"critic_benchmark_leakage:{token}")
+
+    for ident in profile.get("hidden_identifiers", []):
+        if re.search(rf"\b{re.escape(str(ident))}\b", added_blob):
+            reasons.append(f"critic_benchmark_leakage:hidden_id:{ident}")
+
+    expected_hashes: dict[str, str] = dict(profile.get("expected_line_hashes") or {})
+    raw_assertions: list[str] = list(profile.get("raw_assertions") or [])
+    flagged_hashes: set[str] = set()
+    for ln in added_lines:
+        clean_ln = ln.strip().lstrip("-* ").strip()
+        if not clean_ln:
+            continue
+        ln_hash = hashlib.sha256(clean_ln.encode("utf-8")).hexdigest()[:16]
+        if ln_hash in expected_hashes and ln_hash not in flagged_hashes:
+            flagged_hashes.add(ln_hash)
+            reasons.append(f"critic_benchmark_leakage:expected_hash:{ln_hash}")
+            continue
+        for raw_assert in raw_assertions:
+            if raw_assert in clean_ln:
+                ah = hashlib.sha256(raw_assert.encode("utf-8")).hexdigest()[:16]
+                if ah not in flagged_hashes:
+                    flagged_hashes.add(ah)
+                    reasons.append(f"critic_benchmark_leakage:expected_hash:{ah}")
 
     rules_file = worktree / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md"
     rules_bytes = len(rules_file.read_bytes()) if rules_file.is_file() else 0
@@ -317,7 +437,10 @@ def compute_selection_diagnostics(
     eff_min_lat_delta = max(b_lat * min_lat_red, lat_noise_floor)
 
     tok_cap = int(b_tok * (1.0 + max_tok_overhead)) if b_tok > 0 else 0
-    if c_rate < b_rate - eps:
+    if rrsi.get("enforce_anti_goodhart", True) and candidate.get("anti_goodhart_passed") is False:
+        accepted = False
+        reasons = ["anti_goodhart_verifier_tampered"]
+    elif c_rate < b_rate - eps:
         accepted = False
         reasons = [f"pass_rate_regressed:{c_rate:.3f}<{b_rate:.3f}"]
     elif b_tok > 0 and c_tok > tok_cap:
@@ -397,6 +520,8 @@ def _run_bench_in_repo(
     trace_export_dir: Path | None = None,
     n_trials: int = 1,
     sandbox: SandboxAdapter | None = None,
+    manifest_path: Path | None = None,
+    split: str | None = None,
 ) -> dict[str, Any]:
     cmd = [
         "python3",
@@ -408,6 +533,14 @@ def _run_bench_in_repo(
         "--trials",
         str(max(1, n_trials)),
     ]
+    if manifest_path is not None:
+        try:
+            manifest_arg = manifest_path.resolve().relative_to(repo_path.resolve()).as_posix()
+        except ValueError:
+            manifest_arg = str(manifest_path.resolve())
+        cmd.extend(["--manifest", manifest_arg])
+    if split is not None:
+        cmd.extend(["--split", split])
     if trace_export_dir is not None:
         try:
             export_arg = trace_export_dir.resolve().relative_to(repo_path.resolve()).as_posix()
@@ -435,17 +568,35 @@ def run_evolution_cycle(
     branch: str = "rsi/evolved",
     runner: str = "mock",
     mock_bad_proposal: str | None = None,
+    manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
     config = load_rsi_config(repo)
-    n_trials = max(1, int(config.get("rrsi", {}).get("n_trials", 1)))
+    rrsi_cfg = config.get("rrsi", {})
+    n_trials = max(1, int(rrsi_cfg.get("n_trials", 1)))
+    max_ood_reg = float(rrsi_cfg.get("max_ood_regression", 0.05))
     history_path = repo / ".rsi" / "evolution_history.jsonl"
     history = load_jsonl(history_path)
     trace_ctx = _collect_trace_context(repo)
 
-    tasks_manifest = json.loads((repo / "benchmarks" / "tasks.json").read_text(encoding="utf-8"))
-    benchmark_ids = [t["id"] for t in tasks_manifest.get("tasks", [])]
+    effective_manifest = (
+        Path(manifest_path).resolve()
+        if manifest_path is not None
+        else (repo / "benchmarks" / "tasks.json").resolve()
+    )
+    suite = load_benchmark_suite(effective_manifest)
+    all_tasks = suite.get("tasks", [])
+    leakage_profile = build_leakage_fingerprint(all_tasks, effective_manifest)
+    benchmark_ids = list(leakage_profile["task_ids"])
+
+    has_holdout = any(str(t.get("split", "train")).strip().lower() == "holdout" for t in all_tasks)
+    has_ood = any(str(t.get("split", "train")).strip().lower() == "ood" for t in all_tasks)
+    split_mode = (
+        "train_holdout_ood"
+        if (has_holdout and has_ood)
+        else ("train_holdout" if has_holdout else "single")
+    )
 
     base_sha = _ensure_branch(repo, branch)
 
@@ -455,17 +606,54 @@ def run_evolution_cycle(
     try:
         _seed_worktree_traces(repo, worktree_dir)
         wt_traces_dir = worktree_dir / ".rsi" / "traces"
-        baseline_report = _run_bench_in_repo(
-            worktree_dir,
-            runner=runner,
-            trace_export_dir=wt_traces_dir,
-            n_trials=n_trials,
-            sandbox=sandbox,
-        )
-        # Persist exported baseline traces back into main repo's ignored .rsi/traces/
-        # and refresh trace_ctx so Proposer sees the real baseline execution traces.
-        if wt_traces_dir.is_dir():
-            shutil.copytree(wt_traces_dir, repo / ".rsi" / "traces", dirs_exist_ok=True)
+        train_baseline: dict[str, Any] | None = None
+        ood_baseline: dict[str, Any] | None = None
+        ood_candidate: dict[str, Any] | None = None
+
+        if has_holdout:
+            # Proposer sees ONLY train traces; holdout & OOD stay completely isolated.
+            train_baseline = _run_bench_in_repo(
+                worktree_dir,
+                runner=runner,
+                trace_export_dir=wt_traces_dir,
+                n_trials=n_trials,
+                sandbox=sandbox,
+                manifest_path=effective_manifest,
+                split="train",
+            )
+            if wt_traces_dir.is_dir():
+                shutil.copytree(wt_traces_dir, repo / ".rsi" / "traces", dirs_exist_ok=True)
+            baseline_report = _run_bench_in_repo(
+                worktree_dir,
+                runner=runner,
+                trace_export_dir=None,
+                n_trials=n_trials,
+                sandbox=sandbox,
+                manifest_path=effective_manifest,
+                split="holdout",
+            )
+            if has_ood:
+                ood_baseline = _run_bench_in_repo(
+                    worktree_dir,
+                    runner=runner,
+                    trace_export_dir=None,
+                    n_trials=n_trials,
+                    sandbox=sandbox,
+                    manifest_path=effective_manifest,
+                    split="ood",
+                )
+        else:
+            baseline_report = _run_bench_in_repo(
+                worktree_dir,
+                runner=runner,
+                trace_export_dir=wt_traces_dir,
+                n_trials=n_trials,
+                sandbox=sandbox,
+                manifest_path=effective_manifest,
+            )
+            if wt_traces_dir.is_dir():
+                shutil.copytree(wt_traces_dir, repo / ".rsi" / "traces", dirs_exist_ok=True)
+
         trace_ctx = _collect_trace_context(worktree_dir)
 
         if runner == "mock":
@@ -478,7 +666,12 @@ def run_evolution_cycle(
             proposer_note = _runtime_propose(runner, worktree_dir, trace_ctx, history, config=config)
 
         prop_ok, prop_reasons, prop_meta = validate_proposal_rrsi(
-            worktree_dir, base_sha, config, history, benchmark_ids
+            worktree_dir,
+            base_sha,
+            config,
+            history,
+            benchmark_ids,
+            leakage_profile=leakage_profile,
         )
         store = TraceStore(repo)
         diff_text = _git(worktree_dir, "diff", base_sha).stdout
@@ -505,13 +698,17 @@ def run_evolution_cycle(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "run_id": run_id,
                 "branch": branch,
+                "split_mode": split_mode,
                 "n_trials": n_trials,
                 "accepted": False,
                 "stage": "proposal_critic",
                 "reasons": prop_reasons,
                 "proposer_note": proposer_note,
                 "baseline": baseline_report,
+                "train_baseline": train_baseline,
+                "ood_baseline": ood_baseline,
                 "candidate": None,
+                "ood_candidate": None,
                 "store_generation": gen_rec["generation"],
                 "store_dir": gen_rec["snapshot_dir"],
                 **prop_meta,
@@ -526,10 +723,36 @@ def run_evolution_cycle(
             trace_export_dir=cand_traces_dir,
             n_trials=n_trials,
             sandbox=sandbox,
+            manifest_path=effective_manifest,
+            split=("holdout" if has_holdout else None),
         )
         sel_diag = compute_selection_diagnostics(baseline_report, candidate_report, config)
         sel_ok = bool(sel_diag["accepted"])
         sel_reasons = list(sel_diag["reasons"])
+
+        if sel_ok and has_ood and ood_baseline is not None:
+            ood_candidate = _run_bench_in_repo(
+                worktree_dir,
+                runner=runner,
+                trace_export_dir=None,
+                n_trials=n_trials,
+                sandbox=sandbox,
+                manifest_path=effective_manifest,
+                split="ood",
+            )
+            if rrsi_cfg.get("enforce_anti_goodhart", True) and ood_candidate.get("anti_goodhart_passed") is False:
+                sel_ok = False
+                sel_reasons = ["anti_goodhart_verifier_tampered"]
+                sel_diag["accepted"] = False
+                sel_diag["reasons"] = list(sel_reasons)
+            elif float(ood_candidate.get("pass_rate", 0.0)) < float(ood_baseline.get("pass_rate", 0.0)) - max_ood_reg:
+                sel_ok = False
+                sel_reasons = [
+                    f"ood_generalization_regressed:{float(ood_candidate['pass_rate']):.3f}"
+                    f"<{float(ood_baseline['pass_rate']):.3f}"
+                ]
+                sel_diag["accepted"] = False
+                sel_diag["reasons"] = list(sel_reasons)
 
         commit_sha = None
         if sel_ok:
@@ -566,6 +789,7 @@ def run_evolution_cycle(
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": run_id,
             "branch": branch,
+            "split_mode": split_mode,
             "n_trials": n_trials,
             "accepted": sel_ok,
             "commit_sha": commit_sha,
@@ -574,7 +798,10 @@ def run_evolution_cycle(
             "selection_diagnostics": sel_diag,
             "proposer_note": proposer_note,
             "baseline": baseline_report,
+            "train_baseline": train_baseline,
+            "ood_baseline": ood_baseline,
             "candidate": candidate_report,
+            "ood_candidate": ood_candidate,
             "store_generation": gen_rec["generation"],
             "store_dir": gen_rec["snapshot_dir"],
             **prop_meta,
@@ -590,6 +817,7 @@ def main() -> None:
     parser.add_argument("--repo", default=".", help="Target repository path")
     parser.add_argument("--branch", default="rsi/evolved", help="Branch to auto-apply winning edits")
     parser.add_argument("--runner", default="mock", choices=["mock", *list_runtime_adapters()])
+    parser.add_argument("--manifest", default=None, help="Optional benchmark manifest path or Harbor directory")
     parser.add_argument(
         "--mock-bad-proposal",
         default=None,
@@ -603,6 +831,7 @@ def main() -> None:
         branch=args.branch,
         runner=args.runner,
         mock_bad_proposal=args.mock_bad_proposal,
+        manifest_path=Path(args.manifest) if args.manifest else None,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

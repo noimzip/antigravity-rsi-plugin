@@ -31,6 +31,12 @@ from adapters.sandbox import (  # noqa: E402
 )
 from common import load_rsi_config  # noqa: E402
 from evidence_reducer import deterministic_error_slice, reduce_log  # noqa: E402
+from evolve_outer import (  # noqa: E402
+    build_leakage_fingerprint,
+    evaluate_selection_gate,
+    run_evolution_cycle,
+    validate_proposal_rrsi,
+)
 from inner_gate import evaluate_stop  # noqa: E402
 from run_bench import load_benchmark_suite, run_benchmark  # noqa: E402
 from toolchain import detect_project_toolchain, resolve_inner_check  # noqa: E402
@@ -381,6 +387,208 @@ class SandboxAdapterTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             get_sandbox_adapter({"sandbox": {"backend": "invalid-backend"}})
+
+
+class AntiGoodhartAndSplitTests(unittest.TestCase):
+    def _init_repo(self, dest: Path) -> str:
+        shutil.copytree(
+            REPO_ROOT,
+            dest,
+            ignore=shutil.ignore_patterns(".git", ".rsi", "__pycache__"),
+            dirs_exist_ok=True,
+        )
+        subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "RSI Test"], cwd=dest, check=True)
+        subprocess.run(["git", "config", "user.email", "rsi@example.com"], cwd=dest, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=dest, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=dest, check=True, capture_output=True)
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=dest, text=True).strip()
+
+    def test_anti_goodhart_detects_test_tampering_even_after_chmod(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_agy = bin_dir / "agy"
+            fake_agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os\n"
+                "from pathlib import Path\n"
+                "t = Path('test_solution.py')\n"
+                "os.chmod(t, 0o644)\n"
+                "t.write_text('import unittest\\nclass Cheat(unittest.TestCase):\\n    def test_ok(self): pass\\n', encoding='utf-8')\n"
+                "print(json.dumps({'usage': {'total_tokens': 100}}))\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+            orig_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{orig_path}"
+            try:
+                report = run_benchmark(
+                    REPO_ROOT,
+                    REPO_ROOT / "benchmarks" / "tasks.json",
+                    runner="agy",
+                )
+            finally:
+                os.environ["PATH"] = orig_path
+
+            self.assertFalse(report["anti_goodhart_passed"])
+            self.assertEqual(report["passed_tasks"], 0)
+            self.assertEqual(len(report["tampered_tasks"]), 3)
+            self.assertTrue(all(t["tampered"] for t in report["tasks"]))
+
+            cfg = load_rsi_config(REPO_ROOT)
+            ok_gate, gate_reasons = evaluate_selection_gate(
+                {"pass_rate": 0.5, "total_tokens": 1000},
+                report,
+                cfg,
+            )
+            self.assertFalse(ok_gate)
+            self.assertIn("anti_goodhart_verifier_tampered", gate_reasons)
+
+    def test_train_holdout_ood_isolation_and_ood_regression_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            self._init_repo(repo)
+            proposer_log = root / "proposer_seen.txt"
+
+            manifest_path = repo / "benchmarks" / "split_tasks.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "suite_name": "split-suite",
+                        "tasks": [
+                            {
+                                "id": "train_task_alpha",
+                                "split": "train",
+                                "prompt": "TRAIN PROMPT",
+                                "files": {
+                                    "solution.py": "def f(): return 0\n",
+                                    "test_solution.py": "import unittest\nfrom solution import f\nclass T(unittest.TestCase):\n    def test_t(self): self.assertEqual(f(), 1)\n",
+                                },
+                            },
+                            {
+                                "id": "holdout_task_beta",
+                                "split": "holdout",
+                                "prompt": "HOLDOUT PROMPT",
+                                "files": {
+                                    "solution.py": "def g(): return 0\n",
+                                    "test_solution.py": "import unittest\nfrom solution import g\nclass H(unittest.TestCase):\n    def test_h(self): self.assertEqual(g(), 2)\n",
+                                },
+                            },
+                            {
+                                "id": "ood_task_gamma",
+                                "split": "ood",
+                                "prompt": "OOD PROMPT",
+                                "files": {
+                                    "solution.py": "def h(): return 1\n",
+                                    "test_solution.py": "import unittest\nfrom solution import h\nclass O(unittest.TestCase):\n    def test_o(self): self.assertEqual(h(), 1)\n",
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_agy = bin_dir / "agy"
+            fake_agy.write_text(
+                f"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+
+cwd = Path.cwd()
+if os.environ.get("RSI_EVOLUTION_MODE") == "1":
+    trace_dirs = sorted(p.name for p in (cwd / ".rsi" / "traces").iterdir()) if (cwd / ".rsi" / "traces").is_dir() else []
+    Path({str(proposer_log)!r}).write_text(json.dumps({{"traces": trace_dirs, "prompt": sys.argv}}), encoding="utf-8")
+    rules = cwd / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md"
+    rules.write_text(rules.read_text(encoding="utf-8") + "\\n- Generalize across inputs and keep OOD invariants intact.\\n", encoding="utf-8")
+    print(json.dumps({{"ok": True}}))
+    sys.exit(0)
+
+rules_txt = (cwd / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md").read_text(encoding="utf-8")
+evolved = "Generalize across inputs" in rules_txt
+if (cwd / "solution.py").is_file():
+    sol = (cwd / "solution.py").read_text(encoding="utf-8")
+    if "def g()" in sol and evolved:
+        (cwd / "solution.py").write_text("def g(): return 2\\n", encoding="utf-8")
+    elif "def h()" in sol and evolved and os.environ.get("FORCE_OOD_REGRESS") == "1":
+        (cwd / "solution.py").write_text("def h(): return 999\\n", encoding="utf-8")
+    elif "def f()" in sol:
+        (cwd / "solution.py").write_text("def f(): return 1\\n", encoding="utf-8")
+print(json.dumps({{"usage": {{"total_tokens": 500}}}}))
+""",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+            orig_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{orig_path}"
+            os.environ["FORCE_OOD_REGRESS"] = "1"
+            try:
+                res_reg = run_evolution_cycle(
+                    repo,
+                    branch="rsi/evolved",
+                    runner="agy",
+                    manifest_path=manifest_path,
+                )
+            finally:
+                os.environ["PATH"] = orig_path
+                os.environ.pop("FORCE_OOD_REGRESS", None)
+
+            # Proposer never saw holdout/ood traces
+            seen = json.loads(proposer_log.read_text(encoding="utf-8"))
+            joined_seen = json.dumps(seen)
+            self.assertIn("train_task_alpha", joined_seen)
+            self.assertNotIn("holdout_task_beta", joined_seen)
+            self.assertNotIn("ood_task_gamma", joined_seen)
+
+            # Holdout improved (0 -> 1), but OOD regressed (1 -> 0) -> rejected!
+            self.assertEqual(res_reg["split_mode"], "train_holdout_ood")
+            self.assertFalse(res_reg["accepted"])
+            self.assertTrue(any("ood_generalization_regressed" in r for r in res_reg["reasons"]))
+
+    def test_generalized_leakage_critic_blocks_verifier_ids_and_assertions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            base_sha = self._init_repo(repo)
+            cfg = load_rsi_config(repo)
+            tasks = [
+                {
+                    "id": "holdout_alpha",
+                    "split": "holdout",
+                    "files": {
+                        "verify_secret.py": "class SecretHoldoutSuite:\n    def test_secret_holdout_case(self):\n        self.assertEqual(compute_x(7), 49)\n"
+                    },
+                    "verifier": {"script": "verify_secret.sh", "readonly_paths": ["verify_secret.py"]},
+                }
+            ]
+            fp = build_leakage_fingerprint(tasks)
+            rules = repo / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md"
+            orig_rules = rules.read_text(encoding="utf-8")
+
+            cases = [
+                ("verify_secret.sh", "critic_benchmark_leakage:verify_secret.sh"),
+                ("test_secret_holdout_case", "critic_benchmark_leakage:hidden_id:test_secret_holdout_case"),
+                ("self.assertEqual(compute_x(7), 49)", "critic_benchmark_leakage:expected_hash:"),
+            ]
+            for leak_snippet, expected_prefix in cases:
+                subprocess.run(["git", "reset", "--hard", base_sha], cwd=repo, check=True, capture_output=True)
+                rules.write_text(orig_rules + f"\n- {leak_snippet}\n", encoding="utf-8")
+                ok, reasons, _ = validate_proposal_rrsi(
+                    repo,
+                    base_sha,
+                    cfg,
+                    [],
+                    fp["task_ids"],
+                    leakage_profile=fp,
+                )
+                self.assertFalse(ok, msg=f"Expected rejection for {leak_snippet}")
+                self.assertTrue(any(expected_prefix in r for r in reasons), msg=f"Got {reasons}")
 
 
 if __name__ == "__main__":

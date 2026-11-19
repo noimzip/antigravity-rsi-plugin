@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -415,13 +416,13 @@ def _export_task_traces(
                         encoding="utf-8",
                     )
                 copied = True
-    if not copied and runner == "mock":
-        mock_dir = export_dir / f"mock-{task_id}"
-        mock_dir.mkdir(parents=True, exist_ok=True)
-        (mock_dir / "summary.json").write_text(
+    if not copied:
+        fallback_dir = export_dir / f"{runner}-{task_id}"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        (fallback_dir / "summary.json").write_text(
             json.dumps(
                 {
-                    "conversationId": f"mock-{task_id}",
+                    "conversationId": f"{runner}-{task_id}",
                     "total_tokens": tokens,
                     "errors": 0 if passed else 1,
                 },
@@ -431,7 +432,7 @@ def _export_task_traces(
             encoding="utf-8",
         )
         if n_trials > 1:
-            (mock_dir / f"trial_{trial_idx}.json").write_text(
+            (fallback_dir / f"trial_{trial_idx}.json").write_text(
                 json.dumps(
                     {
                         "trial": trial_idx,
@@ -446,6 +447,89 @@ def _export_task_traces(
             )
 
 
+def _identify_verifier_files(task: dict[str, Any], task_dir: Path) -> list[Path]:
+    """Identify test and verifier files inside ``task_dir`` to lock and SHA-256 verify."""
+    protected: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in ("test_*.py", "*_test.py"):
+        for candidate in sorted(task_dir.rglob(pattern)):
+            rel_parts = candidate.relative_to(task_dir).parts
+            if rel_parts and rel_parts[0] in {".agents", ".rsi", ".git", "__pycache__"}:
+                continue
+            if candidate.is_file() and candidate not in seen:
+                seen.add(candidate)
+                protected.append(candidate)
+
+    verifier = task.get("verifier")
+    if isinstance(verifier, dict):
+        for raw_rel in verifier.get("readonly_paths") or []:
+            p = (task_dir / str(raw_rel)).resolve(strict=False)
+            if p.is_file() and p.is_relative_to(task_dir.resolve()) and p not in seen:
+                seen.add(p)
+                protected.append(p)
+    return protected
+
+
+def _hash_files(root: Path, files: list[Path]) -> dict[str, str]:
+    """Return ``{relative_posix_path: sha256_hex}`` for ``files``."""
+    hashes: dict[str, str] = {}
+    root_res = root.resolve()
+    for p in files:
+        if p.is_file() and not p.is_symlink():
+            rel = p.resolve().relative_to(root_res).as_posix()
+            hashes[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return hashes
+
+
+def _set_readonly(files: list[Path], readonly: bool) -> None:
+    """Toggle read-only permissions (``0o444`` vs ``0o644``) on verifier files."""
+    for p in files:
+        if not p.exists() or p.is_symlink():
+            continue
+        try:
+            mode = p.stat().st_mode
+            if readonly:
+                os.chmod(p, mode & ~0o222)
+            else:
+                os.chmod(p, mode | stat.S_IWUSR)
+        except OSError:
+            pass
+
+
+def _verify_integrity(root: Path, expected_hashes: dict[str, str]) -> list[str]:
+    """Verify SHA-256 checksums of verifier/test files after agent execution."""
+    violations: list[str] = []
+    root_res = root.resolve()
+    for rel, expected in expected_hashes.items():
+        target = root_res / rel
+        if target.is_symlink():
+            violations.append(f"symlink_swapped:{rel}")
+        elif not target.is_file():
+            violations.append(f"deleted:{rel}")
+        else:
+            actual = hashlib.sha256(target.read_bytes()).hexdigest()
+            if actual != expected:
+                violations.append(f"modified:{rel}")
+    return violations
+
+
+def _filter_tasks_by_split(
+    tasks: list[dict[str, Any]],
+    split: str | list[str] | None,
+) -> tuple[list[dict[str, Any]], str]:
+    if split is None:
+        return tasks, "all"
+    if isinstance(split, str):
+        parts = [s.strip().lower() for s in split.split(",") if s.strip()]
+    else:
+        parts = [str(s).strip().lower() for s in split if str(s).strip()]
+    if not parts or "all" in parts:
+        return tasks, "all"
+    allowed = set(parts)
+    filtered = [t for t in tasks if str(t.get("split", "train")).strip().lower() in allowed]
+    return filtered, ",".join(sorted(allowed))
+
+
 def _run_single_trial(
     repo_root: Path,
     tasks: list[dict[str, Any]],
@@ -455,10 +539,12 @@ def _run_single_trial(
     trial_idx: int,
     n_trials: int,
     runtime_config: dict[str, Any] | None = None,
+    enforce_anti_goodhart: bool = True,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     passed_count = 0
     total_tokens = 0
+    tampered_tasks: list[str] = []
     started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="rsi-bench-") as tmp_root:
@@ -469,18 +555,41 @@ def _run_single_trial(
             task_dir.mkdir(parents=True, exist_ok=True)
             _materialize_task(task, task_dir, repo_root)
 
-            if runner == "mock":
-                tokens, note = _apply_mock_solution(task_id, task_dir, rules_text)
-            else:
-                tokens, note = _run_adapter_task(
-                    runner,
-                    task.get("prompt", ""),
-                    task_dir,
-                    runtime_config=runtime_config,
-                )
+            verifier_files = _identify_verifier_files(task, task_dir)
+            pre_hashes = _hash_files(task_dir, verifier_files)
+            ro_enabled = enforce_anti_goodhart and bool(
+                (task.get("verifier") or {}).get("readonly", True)
+            )
+            tamper_violations: list[str] = []
+            try:
+                if ro_enabled and verifier_files:
+                    _set_readonly(verifier_files, True)
 
-            grade = _run_task_verifier(task, task_dir, verifier_stage_dir)
-            passed = grade.returncode == 0
+                if runner == "mock":
+                    tokens, note = _apply_mock_solution(task_id, task_dir, rules_text)
+                else:
+                    tokens, note = _run_adapter_task(
+                        runner,
+                        task.get("prompt", ""),
+                        task_dir,
+                        runtime_config=runtime_config,
+                    )
+
+                if enforce_anti_goodhart and pre_hashes:
+                    tamper_violations = _verify_integrity(task_dir, pre_hashes)
+
+                if tamper_violations:
+                    passed = False
+                    tampered_tasks.append(task_id)
+                    grader_tail = f"ANTI_GOODHART_TAMPER_DETECTED: {tamper_violations}"
+                else:
+                    grade = _run_task_verifier(task, task_dir, verifier_stage_dir)
+                    passed = grade.returncode == 0
+                    grader_tail = (grade.stderr or grade.stdout)[-300:]
+            finally:
+                if verifier_files:
+                    _set_readonly(verifier_files, False)
+
             if passed:
                 passed_count += 1
             total_tokens += tokens
@@ -499,10 +608,13 @@ def _run_single_trial(
             results.append(
                 {
                     "id": task_id,
+                    "split": str(task.get("split", "train")),
                     "passed": passed,
+                    "tampered": bool(tamper_violations),
+                    "tamper_violations": tamper_violations,
                     "tokens": tokens,
                     "note": note,
-                    "grader_tail": (grade.stderr or grade.stdout)[-300:],
+                    "grader_tail": grader_tail,
                 }
             )
 
@@ -514,6 +626,8 @@ def _run_single_trial(
         "pass_rate": round(passed_count / total, 4) if total else 0.0,
         "total_tokens": total_tokens,
         "duration_sec": round(time.monotonic() - started, 3),
+        "anti_goodhart_passed": len(tampered_tasks) == 0,
+        "tampered_tasks": sorted(set(tampered_tasks)),
         "tasks": results,
     }
 
@@ -525,6 +639,7 @@ def run_benchmark(
     trace_export_dir: Path | None = None,
     n_trials: int = 1,
     sandbox_backend: str | None = None,
+    split: str | list[str] | None = None,
 ) -> dict[str, Any]:
     """Execute benchmark suite over ``n_trials`` isolated runs and aggregate metrics."""
     if n_trials < 1:
@@ -532,9 +647,10 @@ def run_benchmark(
 
     manifest = load_benchmark_suite(manifest_path)
     rules_text = _load_rules_text(repo_root)
-    tasks = manifest.get("tasks", [])
+    tasks, split_label = _filter_tasks_by_split(manifest.get("tasks", []), split)
     cfg = load_rsi_config(repo_root)
     runtime_config = cfg.get("runtime") if isinstance(cfg.get("runtime"), dict) else None
+    enforce_ag = bool((cfg.get("rrsi") or {}).get("enforce_anti_goodhart", True))
     if sandbox_backend:
         # Validate requested sandbox adapter early via registry factory
         _ = get_sandbox_adapter({"sandbox": {**(cfg.get("sandbox") or {}), "backend": sandbox_backend}})
@@ -551,21 +667,26 @@ def run_benchmark(
                 trial_idx=trial_idx,
                 n_trials=n_trials,
                 runtime_config=runtime_config,
+                enforce_anti_goodhart=enforce_ag,
             )
         )
 
     stats = aggregate_trial_metrics(trials)
     mean_passed = statistics.mean(float(t["passed_tasks"]) for t in trials) if trials else 0.0
+    all_tampered = sorted({tid for t in trials for tid in t.get("tampered_tasks", [])})
     total = len(tasks)
     return {
         "suite": manifest.get("suite_name", "mini-bench"),
         "runner": runner,
+        "split": split_label,
         "n_trials": n_trials,
         "total_tasks": total,
         "passed_tasks": int(round(mean_passed)),
         "pass_rate": round(stats["pass_rate"]["mean"], 4),
         "total_tokens": int(round(stats["total_tokens"]["mean"])),
         "duration_sec": round(stats["duration_sec"]["mean"], 3),
+        "anti_goodhart_passed": len(all_tampered) == 0,
+        "tampered_tasks": all_tampered,
         "stats": stats,
         "trials": trials,
         "tasks": trials[-1]["tasks"] if trials else [],
@@ -580,6 +701,11 @@ def main() -> None:
         "--runner",
         default="mock",
         choices=["mock", *list_runtime_adapters()],
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Optional split filter: all, train, holdout, ood, or comma-separated",
     )
     parser.add_argument(
         "--trials",
@@ -615,6 +741,7 @@ def main() -> None:
         trace_export_dir=trace_export_dir,
         n_trials=args.trials,
         sandbox_backend=args.sandbox_backend,
+        split=args.split,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
