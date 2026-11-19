@@ -11,6 +11,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "inner_check_cmd": "python3 -m unittest discover -s tests",
     "max_inner_retries": 2,
     "evidence_max_chars": 10000,
+    "reducer": {
+        "provider": "none",
+        "command": None,
+        "endpoint": None,
+        "model": "",
+        "api_key_env": "",
+        "timeout_sec": 15,
+    },
     "rrsi": {
         "max_files": 2,
         "max_diff_lines": 80,

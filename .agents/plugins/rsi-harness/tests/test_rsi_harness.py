@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
@@ -19,7 +21,12 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from common import load_jsonl, load_rsi_config  # noqa: E402
-from evidence_reducer import reduce_log  # noqa: E402
+from evidence_reducer import (  # noqa: E402
+    ObservationPack,
+    build_summarizer_from_config,
+    create_observation_handle,
+    reduce_log,
+)
 from evolve_outer import (  # noqa: E402
     compute_selection_diagnostics,
     evaluate_selection_gate,
@@ -285,6 +292,154 @@ class EvidenceReducerTests(unittest.TestCase):
         self.assertTrue(res["fallback_used"])
         self.assertIn("ValueError: zero denominator", res["reduced_text"])
 
+    def test_cli_summarizer_valid_and_failure_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            valid_script = tmp_dir / "valid_sum.py"
+            valid_script.write_text(
+                "import json, sys\n"
+                "_ = sys.stdin.read()\n"
+                "print(json.dumps({'summary': 'CLI diagnosed assertion', 'quotes': ['AssertionError: boom 99']}))\n",
+                encoding="utf-8",
+            )
+            bad_json_script = tmp_dir / "bad_json.py"
+            bad_json_script.write_text("print('not-json')\n", encoding="utf-8")
+            fail_exit_script = tmp_dir / "fail_exit.py"
+            fail_exit_script.write_text("import sys; sys.exit(2)\n", encoding="utf-8")
+
+            raw = ("\n".join(f"noise line {i} " + "y" * 50 for i in range(60))) + "\nAssertionError: boom 99\nFAILED\n"
+
+            sum_ok = build_summarizer_from_config(
+                {"reducer": {"provider": "cli", "command": [sys.executable, str(valid_script)]}}
+            )
+            self.assertIsNotNone(sum_ok)
+            res_ok = reduce_log(raw, max_chars=500, summarizer=sum_ok)
+            self.assertTrue(res_ok["verified"])
+            self.assertFalse(res_ok["fallback_used"])
+            self.assertIn("CLI diagnosed assertion", res_ok["reduced_text"])
+            self.assertIn("AssertionError: boom 99", res_ok["reduced_text"])
+
+            for script in (bad_json_script, fail_exit_script):
+                sum_bad = build_summarizer_from_config(
+                    {"reducer": {"provider": "cli", "command": [sys.executable, str(script)]}}
+                )
+                res_fb = reduce_log(raw, max_chars=500, summarizer=sum_bad)
+                self.assertFalse(res_fb["verified"])
+                self.assertTrue(res_fb["fallback_used"])
+                self.assertIn("AssertionError: boom 99", res_fb["reduced_text"])
+
+    def test_observation_pack_paging_and_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            art = Path(tmp) / "conv-p" / "step_7.log"
+            art.parent.mkdir(parents=True)
+            lines = [f"line-{i:03d}: 日本語ログ payload value={i}\n" for i in range(1, 51)]
+            lines[24] = "line-025: ERROR sentinel marker found here\n"
+            original = "".join(lines)
+            art.write_text(original, encoding="utf-8")
+
+            handle = create_observation_handle(art, step_idx=7, tool_name="run_command")
+            self.assertTrue(Path(handle["meta_path"]).is_file())
+            self.assertTrue(Path(handle["index_path"]).is_file())
+
+            pack = ObservationPack(handle)
+            self.assertEqual(pack.metadata()["line_count"], 50)
+
+            # Reconstruct exact original content via read_lines paging
+            reconstructed_lines: list[str] = []
+            cur_line = 1
+            pages = 0
+            while True:
+                page = pack.read_lines(start_line=cur_line, max_bytes=400)
+                reconstructed_lines.append(page["content"])
+                pages += 1
+                if not page["has_more"]:
+                    break
+                cur_line = int(page["next_line"])
+            self.assertGreater(pages, 1)
+            self.assertEqual("".join(reconstructed_lines), original)
+
+            # Reconstruct exact multi-byte UTF-8 content via read_bytes paging
+            reconstructed_bytes: list[str] = []
+            cur_off = 0
+            b_pages = 0
+            while True:
+                bpage = pack.read_bytes(offset=cur_off, length=333)
+                reconstructed_bytes.append(bpage["content"])
+                b_pages += 1
+                if not bpage["has_more"]:
+                    break
+                cur_off = int(bpage["next_offset"])
+            self.assertGreater(b_pages, 1)
+            self.assertEqual("".join(reconstructed_bytes), original)
+
+            # Search locates sentinel line
+            matches = pack.search(r"ERROR sentinel")
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["line_number"], 25)
+
+            # Boundary checks
+            eof_page = pack.read_bytes(offset=handle["byte_size"] + 100, length=64)
+            self.assertEqual(eof_page["content"], "")
+            self.assertFalse(eof_page["has_more"])
+            with self.assertRaises(ValueError):
+                pack.read_lines(start_line=0)
+            with self.assertRaises(ValueError):
+                pack.read_bytes(offset=-1)
+
+            # CLI --pack inspection works
+            cli_out = subprocess.check_output(
+                [sys.executable, str(SCRIPTS_DIR / "evidence_reducer.py"), "--pack", str(art), "--metadata"],
+                text=True,
+            )
+            self.assertEqual(json.loads(cli_out)["line_count"], 50)
+
+    def test_http_summarizer_endpoint_and_fallback(self) -> None:
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                resp = {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "summary": f"HTTP model={body.get('model')} caught error",
+                                        "quotes": ["KeyError: 'missing_key'"],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+                encoded = json.dumps(resp).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            endpoint = f"http://127.0.0.1:{server.server_port}/summarize"
+            summarizer = build_summarizer_from_config(
+                {"reducer": {"provider": "http", "endpoint": endpoint, "model": "mini-test"}}
+            )
+            self.assertIsNotNone(summarizer)
+            raw = ("\n".join(f"pad {i} " + "z" * 40 for i in range(60))) + "\nKeyError: 'missing_key'\n"
+            res = reduce_log(raw, max_chars=400, summarizer=summarizer)
+            self.assertTrue(res["verified"])
+            self.assertFalse(res["fallback_used"])
+            self.assertIn("HTTP model=mini-test caught error", res["reduced_text"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 class TraceAndInnerGateTests(unittest.TestCase):
     def test_trace_collector_and_inner_gate_loop_cap(self) -> None:
@@ -325,6 +480,18 @@ class TraceAndInnerGateTests(unittest.TestCase):
             summary = record_event(oversized_payload, "post_tool")
             self.assertEqual(summary["total_tokens"], 150)
             self.assertTrue((cwd / ".rsi" / "artifacts" / "conv-1" / "step_1.json").is_file())
+            self.assertTrue((cwd / ".rsi" / "artifacts" / "conv-1" / "step_1.meta.json").is_file())
+            self.assertTrue((cwd / ".rsi" / "artifacts" / "conv-1" / "index.json").is_file())
+
+            events = load_jsonl(cwd / ".rsi" / "traces" / "conv-1" / "events.jsonl")
+            self.assertIn("observationHandle", events[0])
+            pack = ObservationPack(events[0]["observationHandle"])
+            p0 = pack.read_bytes(offset=0, length=4096)
+            p1 = pack.read_bytes(offset=p0["next_offset"], length=4096)
+            self.assertEqual(p0["total_bytes"], events[0]["observationHandle"]["byte_size"])
+            self.assertTrue(p0["has_more"])
+            self.assertIn('"write_file"', p0["content"])
+            self.assertIn("AAAA", p1["content"])
 
             stop_payload = {
                 "conversationId": "conv-1",
@@ -347,6 +514,62 @@ class TraceAndInnerGateTests(unittest.TestCase):
             (cwd / ".rsi" / "traces" / "conv-1" / "retry_count.txt").write_text("0")
             r_cont = evaluate_stop({**stop_payload, "continuationActive": True})
             self.assertEqual(r_cont, {})
+
+    def test_inner_gate_uses_configured_cli_summarizer_and_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            noisy_fail = (
+                "import sys; "
+                "[print(f'noise {i} ' + 'x'*40) for i in range(40)]; "
+                "print('ValueError: exact failure line'); "
+                "sys.exit(1)"
+            )
+            ok_sum = cwd / "ok_sum.py"
+            ok_sum.write_text(
+                "import json, sys; sys.stdin.read()\n"
+                "print(json.dumps({'summary': 'Verified CLI diagnosis', 'quotes': ['ValueError: exact failure line']}))\n",
+                encoding="utf-8",
+            )
+            bad_sum = cwd / "bad_sum.py"
+            bad_sum.write_text(
+                "import json, sys; sys.stdin.read()\n"
+                "print(json.dumps({'summary': 'Hallucinated diagnosis', 'quotes': ['ValueError: fake line']}))\n",
+                encoding="utf-8",
+            )
+
+            (cwd / "rsi.config.json").write_text(
+                json.dumps(
+                    {
+                        "inner_check_cmd": f'python3 -c "{noisy_fail}"',
+                        "max_inner_retries": 3,
+                        "evidence_max_chars": 300,
+                        "reducer": {"provider": "cli", "command": [sys.executable, str(ok_sum)]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stop_payload = {"conversationId": "conv-sum", "cwd": str(cwd), "continuationActive": False}
+            res_ok = evaluate_stop(stop_payload)
+            self.assertEqual(res_ok["decision"], "continue")
+            self.assertIn("Verified CLI diagnosis", res_ok["reason"])
+            self.assertIn("ValueError: exact failure line", res_ok["reason"])
+
+            # Switch to hallucinating summarizer -> fallback removes hallucinated summary and preserves real error
+            (cwd / "rsi.config.json").write_text(
+                json.dumps(
+                    {
+                        "inner_check_cmd": f'python3 -c "{noisy_fail}"',
+                        "max_inner_retries": 3,
+                        "evidence_max_chars": 300,
+                        "reducer": {"provider": "cli", "command": [sys.executable, str(bad_sum)]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            res_fb = evaluate_stop(stop_payload)
+            self.assertEqual(res_fb["decision"], "continue")
+            self.assertNotIn("Hallucinated diagnosis", res_fb["reason"])
+            self.assertIn("ValueError: exact failure line", res_fb["reason"])
 
 
 class OuterLoopTests(unittest.TestCase):

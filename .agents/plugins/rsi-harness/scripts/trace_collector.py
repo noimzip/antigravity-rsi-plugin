@@ -10,21 +10,35 @@ from pathlib import Path
 from typing import Any
 
 from common import append_jsonl, read_hook_input, summarize_transcript, write_hook_output
+from evidence_reducer import create_observation_handle
 
 OVERSIZED_THRESHOLD_BYTES = 10_000
+
+
+def _archive_oversized_with_handle(
+    cwd: Path, conversation_id: str, step_idx: Any, payload: dict[str, Any]
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Persist oversized payload and create an ``ObservationPack`` paging handle."""
+    serialized = json.dumps(payload, ensure_ascii=False)
+    if len(serialized.encode("utf-8")) <= OVERSIZED_THRESHOLD_BYTES:
+        return None, None
+    artifact_path = cwd / ".rsi" / "artifacts" / conversation_id / f"step_{step_idx}.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(serialized, encoding="utf-8")
+    handle = create_observation_handle(
+        artifact_path,
+        step_idx=step_idx,
+        tool_name=payload.get("name") if isinstance(payload, dict) else None,
+    )
+    return str(artifact_path), handle
 
 
 def _archive_if_oversized(
     cwd: Path, conversation_id: str, step_idx: Any, payload: dict[str, Any]
 ) -> str | None:
     """Persist oversized tool arguments/errors as an ObservationPack artifact."""
-    serialized = json.dumps(payload, ensure_ascii=False)
-    if len(serialized.encode("utf-8")) <= OVERSIZED_THRESHOLD_BYTES:
-        return None
-    artifact_path = cwd / ".rsi" / "artifacts" / conversation_id / f"step_{step_idx}.json"
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_path.write_text(serialized, encoding="utf-8")
-    return str(artifact_path)
+    artifact_ref, _ = _archive_oversized_with_handle(cwd, conversation_id, step_idx, payload)
+    return artifact_ref
 
 
 def record_event(payload: dict[str, Any], event_name: str) -> dict[str, Any]:
@@ -36,7 +50,9 @@ def record_event(payload: dict[str, Any], event_name: str) -> dict[str, Any]:
 
     tool_call = payload.get("toolCall") or {}
     step_idx = payload.get("stepIdx", "na")
-    artifact_ref = _archive_if_oversized(cwd, conversation_id, step_idx, tool_call)
+    artifact_ref, observation_handle = _archive_oversized_with_handle(
+        cwd, conversation_id, step_idx, tool_call
+    )
 
     event_record: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -48,6 +64,8 @@ def record_event(payload: dict[str, Any], event_name: str) -> dict[str, Any]:
         "terminationReason": payload.get("terminationReason"),
         "artifactRef": artifact_ref,
     }
+    if observation_handle is not None:
+        event_record["observationHandle"] = observation_handle
     if artifact_ref is None and tool_call:
         event_record["toolArgs"] = tool_call.get("args")
 

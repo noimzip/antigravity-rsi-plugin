@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from common import load_rsi_config, read_hook_input, write_hook_output
-from evidence_reducer import reduce_log
+from evidence_reducer import build_summarizer_from_config, reduce_log
 from trace_collector import record_event
 
 
@@ -68,7 +68,8 @@ def evaluate_stop(payload: dict[str, Any]) -> dict[str, Any]:
     retry_file.write_text(str(retries + 1), encoding="utf-8")
 
     combined_log = (result.stdout or "") + "\n" + (result.stderr or "")
-    reduced = reduce_log(combined_log, max_chars=max_chars)
+    summarizer = build_summarizer_from_config(config, cwd=cwd)
+    reduced = reduce_log(combined_log, max_chars=max_chars, summarizer=summarizer)
     return {
         "decision": "continue",
         "reason": (
