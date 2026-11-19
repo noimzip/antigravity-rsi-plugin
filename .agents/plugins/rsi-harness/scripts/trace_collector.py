@@ -17,6 +17,7 @@ from adapters.events import (
 )
 from common import append_jsonl, read_hook_input, summarize_transcript, write_hook_output
 from evidence_reducer import create_observation_handle
+from trace_schema import export_agent_trace_jsonl, transcript_to_agent_trace
 
 OVERSIZED_THRESHOLD_BYTES = 10_000
 
@@ -96,6 +97,14 @@ def record_normalized_event(
         json.dumps(summary_payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    agent_trace = transcript_to_agent_trace(
+        event.transcript_path,
+        events_path=trace_dir / "events.jsonl",
+        trace_id=conversation_id,
+        runtime=event.runtime,
+        cwd=cwd,
+    )
+    export_agent_trace_jsonl(agent_trace, trace_dir / "agent_trace.jsonl", overwrite=True)
     return summary_payload
 
 

@@ -32,11 +32,18 @@ from adapters.runtime import (  # noqa: E402
     list_runtime_adapters,
     register_runtime_adapter,
 )
-from common import load_jsonl  # noqa: E402
+from common import load_jsonl, summarize_transcript  # noqa: E402
 from guard_harness import evaluate_tool_guard  # noqa: E402
 from inner_gate import evaluate_stop  # noqa: E402
 from run_bench import run_benchmark  # noqa: E402
 from trace_collector import record_event  # noqa: E402
+from trace_schema import (  # noqa: E402
+    AgentTrace,
+    export_agent_trace_jsonl,
+    runtime_result_to_agent_trace,
+    transcript_to_agent_trace,
+    validate_agent_trace,
+)
 
 
 class RuntimeAdapterTests(unittest.TestCase):
@@ -356,6 +363,160 @@ class EventNormalizerTests(unittest.TestCase):
                 }
             )
             self.assertEqual(agy_stop["decision"], "continue")
+
+
+class AgentTraceSchemaTests(unittest.TestCase):
+    def test_transcript_to_agent_trace_opt_in_content_and_mcp_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            transcript = cwd / "transcript.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "step_index": 0,
+                                "type": "USER_INPUT",
+                                "status": "DONE",
+                                "content": "secret prompt text",
+                                "input_tokens": 100,
+                                "cache_read_tokens": 25,
+                                "output_tokens": 0,
+                                "latency_ms": 120.0,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "step_index": 1,
+                                "type": "PLANNER_RESPONSE",
+                                "status": "DONE",
+                                "content": "assistant completion text",
+                                "input_tokens": 20,
+                                "cache_read_tokens": 0,
+                                "output_tokens": 45,
+                                "latency_ms": 230.0,
+                                "tool_calls": [
+                                    {"name": "read_file", "args": {"Path": "a.py"}},
+                                    {"name": "mcp_github_list_issues", "args": {"owner": "x"}},
+                                ],
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # Default include_content=False omits prompt/completion
+            t_redacted = transcript_to_agent_trace(
+                transcript,
+                trace_id="trace-1",
+                runtime="antigravity",
+                model="test-model",
+                cwd=cwd,
+                include_content=False,
+            )
+            d_redacted = t_redacted.to_dict()
+            ok, errs = validate_agent_trace(d_redacted)
+            self.assertTrue(ok, msg=str(errs))
+            self.assertEqual(d_redacted["token_usage"]["total_tokens"], 190)
+            self.assertEqual(d_redacted["otel_attributes"]["gen_ai.usage.input_tokens"], 120)
+            self.assertEqual(d_redacted["otel_attributes"]["gen_ai.usage.output_tokens"], 45)
+            self.assertEqual(d_redacted["latency_ms"], 350.0)
+            kinds = [s["kind"] for s in d_redacted["execution_steps"]]
+            self.assertEqual(kinds, ["llm", "llm", "tool", "mcp"])
+            for s in d_redacted["execution_steps"]:
+                self.assertNotIn("gen_ai.prompt", s["attributes"])
+                self.assertNotIn("gen_ai.completion", s["attributes"])
+
+            # Opt-in include_content=True captures prompt/completion & tool args
+            t_full = transcript_to_agent_trace(
+                transcript,
+                trace_id="trace-2",
+                runtime="antigravity",
+                cwd=cwd,
+                include_content=True,
+            )
+            d_full = t_full.to_dict()
+            self.assertEqual(
+                d_full["execution_steps"][0]["attributes"]["gen_ai.prompt"],
+                "secret prompt text",
+            )
+            self.assertEqual(
+                d_full["execution_steps"][1]["attributes"]["gen_ai.completion"],
+                "assistant completion text",
+            )
+
+            # Exported agent_trace.jsonl is readable by summarize_transcript
+            exported = export_agent_trace_jsonl(t_redacted, cwd / "agent_trace.jsonl", overwrite=True)
+            sum_legacy = summarize_transcript(transcript)
+            sum_otel = summarize_transcript(exported)
+            self.assertEqual(sum_otel["total_tokens"], sum_legacy["total_tokens"])
+            self.assertEqual(sum_otel["tool_calls"], 2)
+            self.assertEqual(sum_otel["latency_ms"], 350.0)
+
+    def test_validate_agent_trace_rejects_invalid_and_converts_runtime_result(self) -> None:
+        res = RuntimeRunResult(
+            runtime_name="claude",
+            command=["claude", "-p", "hi"],
+            exit_code=0,
+            input_tokens=80,
+            output_tokens=20,
+            cache_read_tokens=10,
+            total_tokens=110,
+            duration_sec=0.45,
+        )
+        trace = runtime_result_to_agent_trace(
+            res,
+            trace_id="rt-1",
+            parent_harness_version="sha-parent",
+            candidate_harness_version="sha-cand",
+            cwd="/tmp/repo",
+        )
+        ok, errs = validate_agent_trace(trace.to_dict())
+        self.assertTrue(ok, msg=str(errs))
+        roundtrip = AgentTrace.from_dict(trace.to_dict())
+        self.assertEqual(roundtrip.otel_attributes["gen_ai.system"], "anthropic")
+        self.assertEqual(roundtrip.latency_ms, 450.0)
+
+        # Validation failures
+        bad_missing = trace.to_dict()
+        del bad_missing["trace_id"]
+        ok_m, errs_m = validate_agent_trace(bad_missing)
+        self.assertFalse(ok_m)
+        self.assertTrue(any("trace_id" in e for e in errs_m))
+
+        bad_neg = trace.to_dict()
+        bad_neg["token_usage"]["input_tokens"] = -5
+        ok_n, errs_n = validate_agent_trace(bad_neg)
+        self.assertFalse(ok_n)
+        self.assertIn("invalid_token_field:input_tokens", errs_n)
+
+        bad_otel = trace.to_dict()
+        del bad_otel["otel_attributes"]["gen_ai.system"]
+        ok_o, errs_o = validate_agent_trace(bad_otel)
+        self.assertFalse(ok_o)
+        self.assertIn("missing_otel_attr:gen_ai.system", errs_o)
+
+    def test_trace_collector_emits_validated_agent_trace_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            record_event(
+                {
+                    "conversationId": "conv-otel",
+                    "cwd": str(cwd),
+                    "stepIdx": 1,
+                    "toolCall": {"name": "mcp_context7_query-docs", "args": {"libraryId": "x"}},
+                },
+                "post_tool",
+            )
+            at_path = cwd / ".rsi" / "traces" / "conv-otel" / "agent_trace.jsonl"
+            self.assertTrue(at_path.is_file())
+            records = load_jsonl(at_path)
+            self.assertEqual(len(records), 1)
+            ok, errs = validate_agent_trace(records[0])
+            self.assertTrue(ok, msg=str(errs))
+            self.assertEqual(records[0]["execution_steps"][0]["kind"], "mcp")
 
 
 if __name__ == "__main__":

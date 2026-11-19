@@ -119,7 +119,7 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def summarize_transcript(transcript_path: str | Path | None) -> dict[str, Any]:
-    """Aggregate token usage, steps, tool calls, and errors from ``transcript.jsonl``."""
+    """Aggregate token usage, steps, tool calls, and errors from ``transcript.jsonl`` or ``AgentTrace``."""
     summary: dict[str, Any] = {
         "transcript_path": str(transcript_path or ""),
         "steps": 0,
@@ -129,6 +129,7 @@ def summarize_transcript(transcript_path: str | Path | None) -> dict[str, Any]:
         "cache_read_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "latency_ms": 0.0,
     }
     if not transcript_path:
         return summary
@@ -136,7 +137,35 @@ def summarize_transcript(transcript_path: str | Path | None) -> dict[str, Any]:
     if not path.is_file():
         return summary
 
+    explicit_total = 0
     for entry in load_jsonl(path):
+        if (
+            "schema_version" in entry
+            and isinstance(entry.get("token_usage"), dict)
+            and isinstance(entry.get("execution_steps"), list)
+        ):
+            exec_steps = entry["execution_steps"]
+            summary["steps"] += len(exec_steps)
+            for step in exec_steps:
+                if not isinstance(step, dict):
+                    continue
+                if step.get("status") == "ERROR":
+                    summary["errors"] += 1
+                if step.get("kind") in ("tool", "mcp") or step.get("tool_name"):
+                    summary["tool_calls"] += 1
+            usage = entry["token_usage"]
+            for token_key in ("input_tokens", "cache_read_tokens", "output_tokens"):
+                val = usage.get(token_key)
+                if isinstance(val, int):
+                    summary[token_key] += val
+            tot_val = usage.get("total_tokens")
+            if isinstance(tot_val, int):
+                explicit_total += tot_val
+            lat_val = entry.get("latency_ms")
+            if isinstance(lat_val, (int, float)):
+                summary["latency_ms"] += float(lat_val)
+            continue
+
         summary["steps"] += 1
         if entry.get("status") == "ERROR":
             summary["errors"] += 1
@@ -147,7 +176,11 @@ def summarize_transcript(transcript_path: str | Path | None) -> dict[str, Any]:
             val = entry.get(token_key)
             if isinstance(val, int):
                 summary[token_key] += val
-    summary["total_tokens"] = (
-        summary["input_tokens"] + summary["cache_read_tokens"] + summary["output_tokens"]
-    )
+        lat_val = entry.get("latency_ms")
+        if isinstance(lat_val, (int, float)):
+            summary["latency_ms"] += float(lat_val)
+
+    computed = summary["input_tokens"] + summary["cache_read_tokens"] + summary["output_tokens"]
+    summary["total_tokens"] = max(computed, explicit_total)
+    summary["latency_ms"] = round(summary["latency_ms"], 3)
     return summary
