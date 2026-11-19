@@ -1,0 +1,16 @@
+{
+  "id": "harbor_sample_calc",
+  "format": "harbor",
+  "split": "train",
+  "title": "Fix clamped_add upper bound clamping in workspace/calc.py",
+  "instruction_file": "instruction.md",
+  "environment": {
+    "type": "directory",
+    "source_dir": "workspace",
+    "timeout_sec": 60
+  },
+  "verifier": {
+    "script": "verifier/test.sh",
+    "timeout_sec": 20
+  }
+}

@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -30,26 +32,147 @@ def _load_rules_text(repo_root: Path) -> str:
     return rules_file.read_text(encoding="utf-8")
 
 
-def _materialize_task(task: dict[str, Any], dest: Path, repo_root: Path) -> None:
-    for rel_path, content in task["files"].items():
-        target = dest / rel_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+def _hydrate_harbor_task(task: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    hydrated = dict(task)
+    hydrated["_base_dir"] = str(base_dir.resolve())
+    hydrated.setdefault("split", "train")
+    if hydrated.get("instruction_file") and not hydrated.get("prompt"):
+        inst_path = Path(str(hydrated["instruction_file"]))
+        if not inst_path.is_absolute():
+            inst_path = (base_dir / inst_path).resolve()
+        if inst_path.is_file():
+            hydrated["prompt"] = inst_path.read_text(encoding="utf-8").strip()
+    return hydrated
+
+
+def load_benchmark_suite(manifest_or_dir: Path) -> dict[str, Any]:
+    """Load inline ``tasks.json`` manifests, Harbor task directories, or mixed suites."""
+    target = manifest_or_dir.resolve()
+    if target.is_dir():
+        single_task_json = target / "task.json"
+        if single_task_json.is_file():
+            task_data = json.loads(single_task_json.read_text(encoding="utf-8"))
+            return {
+                "suite_name": target.name,
+                "tasks": [_hydrate_harbor_task(task_data, target)],
+            }
+        tasks: list[dict[str, Any]] = []
+        for child in sorted(target.iterdir()):
+            t_json = child / "task.json"
+            if child.is_dir() and t_json.is_file():
+                t_data = json.loads(t_json.read_text(encoding="utf-8"))
+                tasks.append(_hydrate_harbor_task(t_data, child))
+        return {"suite_name": target.name, "tasks": tasks}
+
+    manifest = json.loads(target.read_text(encoding="utf-8"))
+    if "tasks" not in manifest and "id" in manifest:
+        return {
+            "suite_name": str(manifest.get("id") or target.parent.name),
+            "tasks": [_hydrate_harbor_task(manifest, target.parent)],
+        }
+
+    hydrated_tasks: list[dict[str, Any]] = []
+    for entry in manifest.get("tasks", []):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("task_dir"):
+            task_dir = (target.parent / str(entry["task_dir"])).resolve()
+            task_json = task_dir / "task.json"
+            loaded = json.loads(task_json.read_text(encoding="utf-8")) if task_json.is_file() else {}
+            merged = {**loaded, **entry}
+            hydrated_tasks.append(_hydrate_harbor_task(merged, task_dir))
+        else:
+            hydrated_tasks.append(_hydrate_harbor_task(entry, target.parent))
+    return {
+        "suite_name": manifest.get("suite_name", target.stem),
+        "tasks": hydrated_tasks,
+    }
+
+
+def _materialize_task(task: dict[str, Any], dest: Path, repo_root: Path) -> dict[str, Any]:
+    """Materialize inline or Harbor task workspace files into ``dest``."""
+    base_dir = Path(str(task.get("_base_dir") or repo_root))
+
+    if isinstance(task.get("files"), dict):
+        for rel_path, content in task["files"].items():
+            target = dest / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+
+    env_cfg = task.get("environment")
+    if isinstance(env_cfg, dict):
+        if env_cfg.get("source_dir"):
+            src_dir = Path(str(env_cfg["source_dir"]))
+            if not src_dir.is_absolute():
+                src_dir = (base_dir / src_dir).resolve()
+            if src_dir.is_dir():
+                shutil.copytree(src_dir, dest, dirs_exist_ok=True)
+
+        if env_cfg.get("git_repo"):
+            raw_repo = str(env_cfg["git_repo"])
+            local_candidate = (base_dir / raw_repo).resolve()
+            repo_url = str(local_candidate) if local_candidate.exists() else raw_repo
+            with tempfile.TemporaryDirectory(prefix="rsi-harbor-clone-") as clone_tmp:
+                clone_dir = Path(clone_tmp) / "repo"
+                subprocess.run(
+                    ["git", "clone", repo_url, str(clone_dir)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=int(env_cfg.get("timeout_sec", 60)),
+                )
+                if env_cfg.get("git_ref"):
+                    subprocess.run(
+                        ["git", "checkout", str(env_cfg["git_ref"])],
+                        cwd=str(clone_dir),
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=30,
+                    )
+                shutil.copytree(clone_dir, dest, dirs_exist_ok=True)
+
+        if env_cfg.get("setup_cmd"):
+            setup_env = dict(os.environ)
+            if isinstance(env_cfg.get("env"), dict):
+                setup_env.update({str(k): str(v) for k, v in env_cfg["env"].items()})
+            subprocess.run(
+                str(env_cfg["setup_cmd"]),
+                cwd=str(dest),
+                shell=True,
+                env=setup_env,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=int(env_cfg.get("setup_timeout_sec", 60)),
+            )
 
     plugin_src = repo_root / ".agents" / "plugins" / "rsi-harness"
     if plugin_src.is_dir():
         plugin_dst = dest / ".agents" / "plugins" / "rsi-harness"
         shutil.copytree(plugin_src, plugin_dst, dirs_exist_ok=True)
 
-    task_rsi_config = {
-        "inner_check_cmd": 'python3 -m unittest discover -s . -p "test_*.py"',
-        "max_inner_retries": 2,
-        "evidence_max_chars": 10000,
-    }
-    (dest / "rsi.config.json").write_text(
-        json.dumps(task_rsi_config, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    cfg_path = dest / "rsi.config.json"
+    if not cfg_path.is_file():
+        default_cmd = (
+            str(task["inner_check_cmd"])
+            if task.get("inner_check_cmd") is not None
+            else (
+                'python3 -m unittest discover -s . -p "test_*.py"'
+                if isinstance(task.get("files"), dict)
+                else "auto"
+            )
+        )
+        task_rsi_config = {
+            "inner_check_cmd": default_cmd,
+            "max_inner_retries": 2,
+            "evidence_max_chars": 10000,
+        }
+        cfg_path.write_text(
+            json.dumps(task_rsi_config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return {"base_dir": str(base_dir)}
 
 
 def _apply_mock_solution(task_id: str, task_dir: Path, rules_text: str) -> tuple[int, str]:
@@ -117,7 +240,68 @@ def _apply_mock_solution(task_id: str, task_dir: Path, rules_text: str) -> tuple
             return 1300 + extra_tokens, "mock_applied_task_03"
         return 2900 + extra_tokens, "mock_missed_task_03"
 
+    if task_id == "harbor_sample_calc":
+        calc_path = task_dir / "calc.py"
+        if has_boundary_rule:
+            calc_path.write_text(
+                '"""Sample Harbor workspace module."""\n\n\n'
+                "def clamped_add(a: int, b: int, max_val: int) -> int:\n"
+                '    """Add ``a`` and ``b`` clamped at ``max_val``."""\n'
+                "    return min(a + b, max_val)\n",
+                encoding="utf-8",
+            )
+            return 1100 + extra_tokens, "mock_applied_harbor_sample_calc"
+        return 2200 + extra_tokens, "mock_missed_harbor_sample_calc"
+
     return 1500 + extra_tokens, "mock_unknown"
+
+
+def _run_task_verifier(
+    task: dict[str, Any],
+    task_dir: Path,
+    verifier_stage_dir: Path,
+) -> subprocess.CompletedProcess[str]:
+    """Execute independent Harbor verifier (outside agent workspace) or default unittest."""
+    verifier = task.get("verifier")
+    if isinstance(verifier, dict):
+        timeout_sec = int(verifier.get("timeout_sec", 30))
+        base_dir = Path(str(task.get("_base_dir") or task_dir))
+        if verifier.get("script"):
+            script_src = Path(str(verifier["script"]))
+            if not script_src.is_absolute():
+                script_src = (base_dir / script_src).resolve()
+            verifier_stage_dir.mkdir(parents=True, exist_ok=True)
+            staged = verifier_stage_dir / script_src.name
+            shutil.copy2(script_src, staged)
+            staged.chmod(staged.stat().st_mode | stat.S_IEXEC)
+            env = dict(os.environ)
+            env["RSI_TASK_DIR"] = str(task_dir)
+            env["RSI_VERIFIER_DIR"] = str(verifier_stage_dir)
+            return subprocess.run(
+                ["bash", str(staged)],
+                cwd=str(task_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        if verifier.get("command"):
+            return subprocess.run(
+                str(verifier["command"]),
+                cwd=str(task_dir),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+
+    return subprocess.run(
+        ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
+        cwd=str(task_dir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 
 
 def _run_agy_task(
@@ -280,6 +464,7 @@ def _run_single_trial(
         for task in tasks:
             task_id = task["id"]
             task_dir = Path(tmp_root) / task_id
+            verifier_stage_dir = Path(tmp_root) / "_verifiers" / task_id
             task_dir.mkdir(parents=True, exist_ok=True)
             _materialize_task(task, task_dir, repo_root)
 
@@ -288,18 +473,12 @@ def _run_single_trial(
             else:
                 tokens, note = _run_adapter_task(
                     runner,
-                    task["prompt"],
+                    task.get("prompt", ""),
                     task_dir,
                     runtime_config=runtime_config,
                 )
 
-            grade = subprocess.run(
-                ["python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
-                cwd=str(task_dir),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            grade = _run_task_verifier(task, task_dir, verifier_stage_dir)
             passed = grade.returncode == 0
             if passed:
                 passed_count += 1
@@ -349,7 +528,7 @@ def run_benchmark(
     if n_trials < 1:
         raise ValueError(f"n_trials must be >= 1, got {n_trials}")
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = load_benchmark_suite(manifest_path)
     rules_text = _load_rules_text(repo_root)
     tasks = manifest.get("tasks", [])
     cfg = load_rsi_config(repo_root)

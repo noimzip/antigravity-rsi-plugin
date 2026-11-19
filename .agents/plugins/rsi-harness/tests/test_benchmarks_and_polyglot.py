@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,6 +24,7 @@ if str(REPO_ROOT / "benchmarks") not in sys.path:
 from common import load_rsi_config  # noqa: E402
 from evidence_reducer import deterministic_error_slice, reduce_log  # noqa: E402
 from inner_gate import evaluate_stop  # noqa: E402
+from run_bench import load_benchmark_suite, run_benchmark  # noqa: E402
 from toolchain import detect_project_toolchain, resolve_inner_check  # noqa: E402
 
 
@@ -151,6 +156,97 @@ class ToolchainAndPolyglotTests(unittest.TestCase):
             reduced = reduce_log(raw, max_chars=500)
             self.assertTrue(reduced["was_reduced"])
             self.assertIn(first_line, reduced["reduced_text"])
+
+
+class HarborContractTests(unittest.TestCase):
+    def test_sample_harbor_directory_and_legacy_manifest(self) -> None:
+        sample_dir = REPO_ROOT / "benchmarks" / "harbor_examples" / "sample_task"
+        suite = load_benchmark_suite(sample_dir)
+        self.assertEqual(len(suite["tasks"]), 1)
+        self.assertIn("clamped_add", suite["tasks"][0]["prompt"])
+
+        # Mock runner fixes harbor_sample_calc using AGENTS.md boundary rule -> passes independent test.sh
+        report = run_benchmark(REPO_ROOT, sample_dir, runner="mock")
+        self.assertEqual(report["total_tasks"], 1)
+        self.assertEqual(report["passed_tasks"], 1)
+        self.assertEqual(report["tasks"][0]["id"], "harbor_sample_calc")
+
+        # Legacy tasks.json remains 100% compatible
+        legacy_report = run_benchmark(REPO_ROOT, REPO_ROOT / "benchmarks" / "tasks.json", runner="mock")
+        self.assertEqual(legacy_report["total_tasks"], 3)
+        self.assertEqual(legacy_report["passed_tasks"], 2)
+
+    def test_harbor_git_repo_checkout_and_independent_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ext_repo = root / "external_repo"
+            ext_repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=ext_repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=ext_repo, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=ext_repo, check=True)
+            (ext_repo / "pkg.py").write_text("def mul(a, b):\n    return a + b  # buggy\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=ext_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "buggy v1"], cwd=ext_repo, check=True, capture_output=True)
+            v1_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ext_repo, text=True).strip()
+
+            # Advance main further so git_ref checkout is actually exercised
+            (ext_repo / "README.md").write_text("later commit\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=ext_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "later"], cwd=ext_repo, check=True, capture_output=True)
+
+            harbor_task = root / "harbor_suite" / "git_task"
+            (harbor_task / "verifier").mkdir(parents=True)
+            (harbor_task / "instruction.md").write_text("Fix mul(a, b) in pkg.py to multiply.\n", encoding="utf-8")
+            verifier_sh = harbor_task / "verifier" / "test.sh"
+            verifier_sh.write_text(
+                "#!/usr/bin/env bash\nset -euo pipefail\n"
+                "test ! -d verifier\n"
+                "python3 -c 'from pkg import mul; assert mul(3, 4) == 12'\n",
+                encoding="utf-8",
+            )
+            verifier_sh.chmod(verifier_sh.stat().st_mode | stat.S_IEXEC)
+            (harbor_task / "task.json").write_text(
+                json.dumps(
+                    {
+                        "id": "harbor_git_mul",
+                        "format": "harbor",
+                        "instruction_file": "instruction.md",
+                        "environment": {
+                            "type": "git",
+                            "git_repo": str(ext_repo),
+                            "git_ref": v1_sha,
+                        },
+                        "verifier": {"script": "verifier/test.sh", "timeout_sec": 20},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Without fix (mock unknown) -> independent verifier fails
+            fail_rep = run_benchmark(REPO_ROOT, harbor_task, runner="mock")
+            self.assertEqual(fail_rep["passed_tasks"], 0)
+
+            # With fake `agy` fixing pkg.py -> independent verifier passes
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_agy = bin_dir / "agy"
+            fake_agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "from pathlib import Path\n"
+                "Path('pkg.py').write_text('def mul(a, b):\\n    return a * b\\n', encoding='utf-8')\n"
+                "print(json.dumps({'usage': {'total_tokens': 321}}))\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+            orig_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{orig_path}"
+            try:
+                pass_rep = run_benchmark(REPO_ROOT, harbor_task, runner="agy")
+            finally:
+                os.environ["PATH"] = orig_path
+            self.assertEqual(pass_rep["passed_tasks"], 1)
+            self.assertEqual(pass_rep["total_tokens"], 321)
 
 
 if __name__ == "__main__":
