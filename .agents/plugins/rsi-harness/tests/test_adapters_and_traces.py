@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,6 +34,7 @@ from adapters.runtime import (  # noqa: E402
     register_runtime_adapter,
 )
 from common import load_jsonl, summarize_transcript  # noqa: E402
+from evolve_outer import run_evolution_cycle  # noqa: E402
 from guard_harness import evaluate_tool_guard  # noqa: E402
 from inner_gate import evaluate_stop  # noqa: E402
 from run_bench import run_benchmark  # noqa: E402
@@ -44,6 +46,7 @@ from trace_schema import (  # noqa: E402
     transcript_to_agent_trace,
     validate_agent_trace,
 )
+from trace_store import TraceStore  # noqa: E402
 
 
 class RuntimeAdapterTests(unittest.TestCase):
@@ -517,6 +520,114 @@ class AgentTraceSchemaTests(unittest.TestCase):
             ok, errs = validate_agent_trace(records[0])
             self.assertTrue(ok, msg=str(errs))
             self.assertEqual(records[0]["execution_steps"][0]["kind"], "mcp")
+
+
+class TraceStoreTests(unittest.TestCase):
+    def _create_temp_git_repo(self, dest: Path) -> None:
+        shutil.copytree(
+            REPO_ROOT,
+            dest,
+            ignore=shutil.ignore_patterns(".git", ".rsi", "__pycache__"),
+            dirs_exist_ok=True,
+        )
+        subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "RSI Test"], cwd=dest, check=True)
+        subprocess.run(["git", "config", "user.email", "rsi@example.com"], cwd=dest, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=dest, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=dest, check=True, capture_output=True)
+
+    def test_store_records_multiple_generations_queries_greps_and_mounts_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            self._create_temp_git_repo(repo)
+
+            r_leak = run_evolution_cycle(repo, branch="rsi/evolved", runner="mock", mock_bad_proposal="leak")
+            r_budget = run_evolution_cycle(repo, branch="rsi/evolved", runner="mock", mock_bad_proposal="budget")
+            r_ok = run_evolution_cycle(repo, branch="rsi/evolved", runner="mock")
+
+            self.assertEqual(r_leak["store_generation"], 1)
+            self.assertEqual(r_budget["store_generation"], 2)
+            self.assertEqual(r_ok["store_generation"], 3)
+
+            store = TraceStore(repo)
+            self.assertEqual(len(store.list_generations()), 3)
+            self.assertEqual(len(store.list_generations(accepted=True)), 1)
+            self.assertEqual(len(store.list_generations(accepted=False)), 2)
+
+            # Verify uncompressed artifacts persisted per generation
+            gen3_dir = Path(r_ok["store_dir"])
+            self.assertTrue((gen3_dir / "proposal.diff").is_file())
+            self.assertTrue((gen3_dir / "config_snapshot.json").is_file())
+            self.assertTrue((gen3_dir / "metadata.json").is_file())
+            self.assertTrue((gen3_dir / "harness_files" / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md").is_file())
+            self.assertTrue((gen3_dir / "traces" / "mock-task_01_edge_case" / "summary.json").is_file())
+            self.assertTrue((gen3_dir / "candidate_traces" / "mock-task_03_multi_file_rule" / "summary.json").is_file())
+
+            # Query filters
+            by_gen = store.query(generation=2)
+            self.assertEqual(len(by_gen), 1)
+            self.assertEqual(by_gen[0]["run_id"], r_budget["run_id"])
+
+            by_task = store.query(task_id="task_03_multi_file_rule")
+            self.assertEqual(len(by_task), 3)
+
+            by_err = store.query(error_type="critic_benchmark_leakage")
+            self.assertEqual(len(by_err), 1)
+            self.assertEqual(by_err[0]["generation"], 1)
+
+            by_text = store.query(text="padding rule line 42")
+            self.assertEqual(len(by_text), 1)
+            self.assertEqual(by_text[0]["generation"], 2)
+
+            # Regex grep across uncompressed traces and diffs
+            hits = store.grep_traces(r"parse_kv_lines", generation=1)
+            self.assertTrue(any(h["file"] == "proposal.diff" for h in hits))
+
+            bundle = store.get_generation_bundle(3)
+            self.assertIsNotNone(bundle)
+            self.assertIn("AGENTS.md", "\n".join(bundle["harness_files"]))
+
+            # Read-only worktree mount uses symlinks instead of copying store
+            wt = Path(tmp) / "wt"
+            wt.mkdir()
+            mounted = store.mount_readonly_into_worktree(wt)
+            self.assertIn("store", mounted)
+            self.assertTrue((wt / ".rsi" / "store").is_symlink())
+            self.assertTrue((wt / ".rsi" / "traces_archive").is_symlink())
+            self.assertTrue((wt / ".rsi" / "evolution_history.jsonl").is_symlink())
+            self.assertFalse((wt / ".rsi" / "traces").is_symlink())
+
+            # CLI query & grep subcommands work
+            q_out = subprocess.check_output(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "trace_store.py"),
+                    "--repo",
+                    str(repo),
+                    "query",
+                    "--accepted",
+                    "true",
+                ],
+                text=True,
+            )
+            q_parsed = json.loads(q_out)
+            self.assertEqual(len(q_parsed), 1)
+            self.assertEqual(q_parsed[0]["generation"], 3)
+
+            g_out = subprocess.check_output(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "trace_store.py"),
+                    "--repo",
+                    str(repo),
+                    "grep",
+                    "--pattern",
+                    "padding rule line 10",
+                ],
+                text=True,
+            )
+            g_parsed = json.loads(g_out)
+            self.assertGreaterEqual(len(g_parsed), 1)
 
 
 if __name__ == "__main__":

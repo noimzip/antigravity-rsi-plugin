@@ -29,6 +29,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from adapters.runtime import get_runtime_adapter, list_runtime_adapters  # noqa: E402
 from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
+from trace_store import TraceStore  # noqa: E402
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -66,10 +67,13 @@ def _collect_trace_context(repo: Path) -> dict[str, Any]:
             for ev in load_jsonl(events_file):
                 if ev.get("error"):
                     error_samples.append(ev)
+    store_entries = load_jsonl(repo / ".rsi" / "store" / "index.jsonl")
     return {
         "summaries": summaries,
         "error_samples": error_samples[-20:],
         "history_count": len(load_jsonl(repo / ".rsi" / "evolution_history.jsonl")),
+        "store_generations": len(store_entries),
+        "recent_store_entries": store_entries[-5:],
     }
 
 
@@ -121,16 +125,8 @@ def _mock_propose(
 
 
 def _seed_worktree_traces(repo: Path, worktree: Path) -> None:
-    """Copy ignored `.rsi/traces` and history into candidate ``worktree`` readably."""
-    src_traces = repo / ".rsi" / "traces"
-    if src_traces.is_dir():
-        dst_traces = worktree / ".rsi" / "traces"
-        shutil.copytree(src_traces, dst_traces, dirs_exist_ok=True)
-    src_history = repo / ".rsi" / "evolution_history.jsonl"
-    if src_history.is_file():
-        dst_history = worktree / ".rsi" / "evolution_history.jsonl"
-        dst_history.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_history, dst_history)
+    """Mount historical store, trace archive, and history into ``worktree`` via symlinks."""
+    TraceStore(repo).mount_readonly_into_worktree(worktree)
 
 
 def _build_proposer_prompt(
@@ -152,7 +148,9 @@ def _build_proposer_prompt(
         "4. Do NOT hardcode task names or test filenames; propose generalizable engineering heuristics.\n"
         f"Recent trace context: {trace_summary}\n"
         f"Recent evolution history (avoid failed hypotheses): {history_tail}\n"
-        f"Inspect `{resolved_wt}/.rsi/traces/` if present, then make one concise improvement inside `{resolved_wt}`."
+        f"Inspect `{resolved_wt}/.rsi/traces/` and uncompressed history in `{resolved_wt}/.rsi/store/` "
+        f"(or run `python3 .agents/plugins/rsi-harness/scripts/trace_store.py --repo {resolved_wt} query/grep`) "
+        f"if present, then make one concise improvement inside `{resolved_wt}`."
     )
 
 
@@ -473,8 +471,27 @@ def run_evolution_cycle(
         prop_ok, prop_reasons, prop_meta = validate_proposal_rrsi(
             worktree_dir, base_sha, config, history, benchmark_ids
         )
+        store = TraceStore(repo)
+        diff_text = _git(worktree_dir, "diff", base_sha).stdout
 
         if not prop_ok:
+            gen_rec = store.record_generation(
+                run_id=run_id,
+                branch=branch,
+                parent_sha=base_sha,
+                commit_sha=None,
+                accepted=False,
+                stage="proposal_critic",
+                reasons=prop_reasons,
+                diff_text=diff_text,
+                changed_files=list(prop_meta.get("changed_files", [])),
+                config=config,
+                baseline_report=baseline_report,
+                candidate_report=None,
+                traces_src_dir=wt_traces_dir,
+                worktree=worktree_dir,
+                proposer_note=proposer_note,
+            )
             record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "run_id": run_id,
@@ -486,12 +503,20 @@ def run_evolution_cycle(
                 "proposer_note": proposer_note,
                 "baseline": baseline_report,
                 "candidate": None,
+                "store_generation": gen_rec["generation"],
+                "store_dir": gen_rec["snapshot_dir"],
                 **prop_meta,
             }
             append_jsonl(history_path, record)
             return record
 
-        candidate_report = _run_bench_in_repo(worktree_dir, runner=runner, n_trials=n_trials)
+        cand_traces_dir = worktree_dir / ".rsi" / "cand_traces"
+        candidate_report = _run_bench_in_repo(
+            worktree_dir,
+            runner=runner,
+            trace_export_dir=cand_traces_dir,
+            n_trials=n_trials,
+        )
         sel_diag = compute_selection_diagnostics(baseline_report, candidate_report, config)
         sel_ok = bool(sel_diag["accepted"])
         sel_reasons = list(sel_diag["reasons"])
@@ -508,6 +533,25 @@ def run_evolution_cycle(
             commit_sha = _git(worktree_dir, "rev-parse", "HEAD").stdout.strip()
             _git(repo, "branch", "-f", branch, commit_sha)
 
+        gen_rec = store.record_generation(
+            run_id=run_id,
+            branch=branch,
+            parent_sha=base_sha,
+            commit_sha=commit_sha,
+            accepted=sel_ok,
+            stage="selection_gate",
+            reasons=sel_reasons,
+            diff_text=diff_text,
+            changed_files=list(prop_meta.get("changed_files", [])),
+            config=config,
+            baseline_report=baseline_report,
+            candidate_report=candidate_report,
+            traces_src_dir=wt_traces_dir,
+            candidate_traces_dir=cand_traces_dir,
+            worktree=worktree_dir,
+            proposer_note=proposer_note,
+        )
+
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": run_id,
@@ -521,6 +565,8 @@ def run_evolution_cycle(
             "proposer_note": proposer_note,
             "baseline": baseline_report,
             "candidate": candidate_report,
+            "store_generation": gen_rec["generation"],
+            "store_dir": gen_rec["snapshot_dir"],
             **prop_meta,
         }
         append_jsonl(history_path, record)
