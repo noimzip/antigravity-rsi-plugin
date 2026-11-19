@@ -1,43 +1,76 @@
 # antigravity-rsi-plugin (`rsi-harness`)
 
-**Meta-Harness**・**RRSI**・**SoL-Pi** の設計思想を取り入れた Antigravity 向け自己再帰的改善ハーネス（`.agents/plugins/rsi-harness/`）および検証用ミニベンチマークのリポジトリです。
+An open-ended **Recursive Self-Improvement (RSI) & Agent Harness Evolution** framework built as both a standalone zero-dependency Python package/CLI (`rsi-harness`) and an Antigravity IDE plugin (`.agents/plugins/rsi-harness/`).
 
-## 構成
+It implements and unifies:
 
-- `src/tasklib.py` / `tests/test_tasklib.py`: サンプル Python モジュールと単体テスト
-- `rsi.config.json`: Inner Loop の検査コマンドおよび RRSI の編集予算・ゲート閾値設定
-- `.agents/plugins/rsi-harness/`: Antigravity プラグイン本体
-  - `hooks.json`: `PreToolUse` 改変ガード / `PostToolUse` トレース収集 / `Stop` 品質ゲート
-  - `rules/AGENTS.md`: 常時適用ルール（Outer Loop による改善対象）
-  - `skills/evolve-harness/SKILL.md`: Outer Loop 実行用スキル
-  - `scripts/`: 各種フックスクリプトと `evolve_outer.py`
-- `benchmarks/`: 検証用ミニベンチマーク（3課題）とランナー
+- **Meta-Harness** — Raw execution traces stored uncompressed in `.rsi/store/` & OTel `gen_ai.*` `agent_trace.jsonl` so the Outer Loop proposer inspects full evidence and tool history via symlinked worktrees.
+- **RRSI (Regularized Recursive Self-Improvement)** — Proposal-side budget annealing, structural pruning (`--prune`), generalized holdout/OOD leakage Critic, Anti-Goodhart SHA-256 read-only verifier protection, and variance-aware Pareto multi-trial selection gates.
+- **SoL-Pi** — Inner-loop execution/trace gates (`guard_harness.py`, `inner_gate.py`, `evidence_reducer.py` + `ObservationPack` paging, polyglot `toolchain.py`, atomic multi-edit `action_fusion.py`, and trace compaction `context_compact.py`).
+- **DGM (Darwin Gödel Machine)** — Open-ended `LineageArchive` DAG (`.rsi/lineage.json`) supporting multi-branch evolution, Pareto frontier tracking, novelty scoring, and diversity-preserving parent sampling.
 
-## 検証コマンド
+---
+
+## Repository Structure
+
+- `rsi_harness/` & `pyproject.toml`: Zero-dependency Python 3.11+ package and `rsi-harness` CLI (`init`, `evolve`, `status`, `mine`, `lineage`).
+- `.agents/plugins/rsi-harness/`: Antigravity plugin bundle (`plugin.json`, `hooks.json`, `rules/`, `skills/`, `scripts/`, `tests/`):
+  - `scripts/adapters/`: Multi-runtime adapters (`agy`, `claude`, `codex`, `gemini`, `pty`), normalized hook events (`events.py`), and sandbox backends (`GitWorktreeSandbox`, hardened `DockerSandbox`, `RemoteSandboxAdapter`).
+  - `scripts/trace_schema.py`, `scripts/trace_collector.py`, `scripts/trace_store.py`: OTel `gen_ai.*` trace normalization and uncompressed generational trace store.
+  - `scripts/toolchain.py`, `scripts/surface.py`, `scripts/weakness_miner.py`, `scripts/budget_and_pruning.py`: Polyglot test detection, declarative `harness.yaml` mutable surface, real-session weakness mining, and annealed pruning.
+  - `scripts/lineage.py`, `scripts/interfaces.py`, `scripts/pr_reporter.py`, `scripts/evolve_outer.py`: DGM DAG archive, pluggable `Proposer`/`Evaluator`/`Critic` + `MetaRewardEvaluator`, evidence-backed PR reporting (`gh pr create`), and outer loop orchestration.
+- `benchmarks/`: Multi-trial Harbor & JSON benchmark runner (`benchmarks/run_bench.py`, `benchmarks/tasks.json`, `benchmarks/harbor_examples/sample_task/`).
+- `src/` & `tests/`: Sample baseline target library and regression tests.
+
+---
+
+## Quick Start (`rsi-harness` CLI)
 
 ```bash
-# 1. プラグインマニフェスト・構造検証
-agy plugin validate ./.agents/plugins/rsi-harness --strict --json
+# Auto-detect project toolchain & scaffold harness.yaml / rsi.config.json safely
+python3 -m rsi_harness init --repo . --dry-run
 
-# 2. サンプルプロジェクトのテスト
-python3 -m unittest discover -s tests -v
+# Inspect configuration, trace store, and lineage status
+python3 -m rsi_harness status --repo . --json
 
-# 3. プラグイン & Outer Loop の単体テスト
-python3 -m unittest discover -s .agents/plugins/rsi-harness/tests -v
+# Mine failure/inefficiency clusters from trace logs
+python3 -m rsi_harness mine --repo .
 
-# 4. ミニベンチマーク実行（モックランナー）
-python3 benchmarks/run_bench.py --runner mock
+# Run one outer evolution cycle and generate a PR report (dry-run)
+python3 -m rsi_harness evolve --repo . --runner mock --parent-strategy dgm --pr-dry-run
 
-# 5. Outer Loop 進化サイクルのテスト実行（rsi/evolved ブランチへ自動適用）
-python3 .agents/plugins/rsi-harness/scripts/evolve_outer.py --runner mock --branch rsi/evolved
+# Inspect the DGM lineage DAG and Pareto frontier
+python3 -m rsi_harness lineage --repo . --pareto
 ```
 
-## ライセンスと参考文献 (License & References)
+---
 
-本リポジトリ内のコードおよび設定は Python 標準ライブラリのみを用いて新規作成されており、**MIT License**（[LICENSE](./LICENSE)）の下で公開されています。第三者コードのコピーは含みません。
+## Verification Commands
 
-設計は以下の研究論文のコンセプトから着想を得ています：
+```bash
+# Validate Antigravity plugin schema strictly
+agy plugin validate ./.agents/plugins/rsi-harness --strict --json
 
-- **Meta-Harness**: *Meta-Harness: End-to-End Optimization of Model Harnesses* ([arXiv:2603.28052](https://arxiv.org/abs/2603.28052))
-- **RRSI**: *RRSI: Regularized Recursive Self-Improvement of Agent Harnesses* ([arXiv:2609.24972](https://arxiv.org/abs/2609.24972))
-- **SoL-Pi**: *SoL-Pi: Recursively Scaling Auto-Research Loops for Efficient Agent Harness* ([arXiv:2609.20519](https://arxiv.org/abs/2609.20519))
+# Run baseline library unit tests
+python3 -m unittest discover -s tests -v
+
+# Run full RSI-Harness plugin, adapter, benchmark, and CLI test suite
+python3 -m unittest discover -s .agents/plugins/rsi-harness/tests -v
+
+# Run 3-trial mock benchmark suite
+python3 benchmarks/run_bench.py --runner mock --trials 3
+
+# Inspect CLI status output
+python3 -m rsi_harness status --repo . --json
+```
+
+---
+
+## License & References
+
+- Licensed under the **MIT License** (see `LICENSE`).
+- Research inspirations:
+  - **Meta-Harness** (`arXiv:2603.24693`) — End-to-End Optimization of Model Harnesses
+  - **Darwin Gödel Machine** (`arXiv:2505.22954`) — Open-Ended Evolution of Self-Improving Agents
+  - **RRSI** (`arXiv:2604.06232`) — Regularizing Recursive Self-Improvement Against Goodhart's Law
+  - **SoL-Pi** (`arXiv:2604.14228`) — Joint Prompt & Code Co-Evolution with Action Fusion & Context Compact

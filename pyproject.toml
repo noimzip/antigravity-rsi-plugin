@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsi-harness"
+version = "0.2.0"
+description = "Recursive self-improvement harness, multi-runtime outer loop, DGM lineage archive, and PR reporter"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+rsi-harness = "rsi_harness.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rsi_harness*"]

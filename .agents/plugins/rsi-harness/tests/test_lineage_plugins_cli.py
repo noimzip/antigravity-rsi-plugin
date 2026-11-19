@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -33,6 +36,8 @@ from interfaces import (  # noqa: E402
     load_plugin,
 )
 from lineage import LineageArchive, main as lineage_main  # noqa: E402
+from pr_reporter import create_review_pr, generate_pr_report  # noqa: E402
+from toolchain import detect_project_toolchain  # noqa: E402
 
 
 def _init_git_repo(repo: Path, *, with_harness_yaml: bool = True) -> None:
@@ -382,6 +387,199 @@ class CustomCritic:
             load_plugin(12345, Proposer, lambda: None)  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             load_plugin("builtins:dict", Proposer, lambda: None)  # type: ignore[arg-type]
+
+
+class PrReporterAndCliTests(unittest.TestCase):
+    def test_pr_reporter_safety_dry_run_and_mocked_gh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _init_git_repo(repo)
+            record = {
+                "run_id": "abcd1234",
+                "accepted": True,
+                "stage": "selection_gate",
+                "branch": "rsi/evolved",
+                "node_branch": "rsi/node-abcd1234",
+                "parent_node_id": "root",
+                "lineage_node_id": "node-abcd1234",
+                "parent_strategy": "dgm",
+                "commit_sha": "",
+                "evolution_mode": "benchmark",
+                "split_mode": "single",
+                "n_trials": 3,
+                "reasons": ["pass_rate_improved:+0.333"],
+                "proposer_note": "Added generalized boundary check",
+                "plugins_used": {"proposer": "DefaultProposer"},
+                "pareto_frontier_ids": ["node-abcd1234"],
+                "changed_files": ["AGENTS.md"],
+                "diff_lines": 2,
+                "rules_bytes": 120,
+                "diff_hash": "0123456789abcdef",
+                "baseline": {"pass_rate": 0.3333, "total_tokens": 5700, "duration_sec": 0.3, "anti_goodhart_passed": True},
+                "candidate": {"pass_rate": 0.6667, "total_tokens": 4100, "duration_sec": 0.25, "anti_goodhart_passed": True},
+            }
+
+            report_md = generate_pr_report(record, repo_root=repo, diff_text="+ - Verify empty inputs\n")
+            self.assertIn("RSI-Harness Evolution Report", report_md)
+            self.assertIn("0.6667", report_md)
+            self.assertIn("+ - Verify empty inputs", report_md)
+
+            # Safety refusals
+            with self.assertRaises(ValueError):
+                create_review_pr(repo, record, base_branch="main", head_branch="main", dry_run=True)
+            with self.assertRaises(ValueError):
+                create_review_pr(repo, record, base_branch="develop", head_branch="master", dry_run=True)
+            with self.assertRaises(ValueError):
+                create_review_pr(repo, record, base_branch="feature", head_branch="feature", dry_run=True)
+            with self.assertRaises(ValueError):
+                create_review_pr(repo, {**record, "accepted": False}, base_branch="main", dry_run=False, push=False)
+
+            # Dry-run writes report file cleanly without calling gh
+            dry_res = create_review_pr(
+                repo,
+                record,
+                base_branch="main",
+                dry_run=True,
+                diff_text="+ - Boundary check\n",
+            )
+            self.assertTrue(dry_res["dry_run"])
+            self.assertFalse(dry_res["created"])
+            report_path = Path(dry_res["report_path"])
+            self.assertTrue(report_path.is_file())
+            self.assertIn("AGENTS.md", report_path.read_text(encoding="utf-8"))
+
+            # Mocked gh executable on PATH
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            gh_log = root / "gh_args.json"
+            gh_script = bin_dir / "gh"
+            gh_script.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                f"open({str(gh_log)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+                "print('https://github.com/example/repo/pull/99')\n",
+                encoding="utf-8",
+            )
+            gh_script.chmod(gh_script.stat().st_mode | stat.S_IEXEC)
+
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{old_path}"
+            try:
+                live_res = create_review_pr(repo, record, base_branch="main", dry_run=False, push=False)
+            finally:
+                os.environ["PATH"] = old_path
+
+            self.assertTrue(live_res["created"])
+            self.assertEqual(live_res["pr_url"], "https://github.com/example/repo/pull/99")
+            captured = json.loads(gh_log.read_text(encoding="utf-8"))
+            self.assertEqual(captured[:4], ["pr", "create", "--base", "main"])
+            self.assertIn("rsi/node-abcd1234", captured)
+            self.assertIn(str(report_path), captured)
+
+    def test_pyproject_pure_stdlib_and_repo_toolchain_still_unittest(self) -> None:
+        pyproject_path = REPO_ROOT / "pyproject.toml"
+        self.assertTrue(pyproject_path.is_file())
+        parsed = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        self.assertEqual(parsed["project"]["name"], "rsi-harness")
+        self.assertEqual(parsed["project"]["dependencies"], [])
+        self.assertEqual(parsed["project"]["scripts"]["rsi-harness"], "rsi_harness.cli:main")
+        self.assertNotIn("pytest", pyproject_path.read_text(encoding="utf-8").lower())
+
+        tc = detect_project_toolchain(REPO_ROOT)
+        self.assertEqual(tc.language, "python")
+        self.assertEqual(tc.tool, "unittest")
+
+    def test_cli_init_polyglot_non_clobber_and_commands(self) -> None:
+        def _run_cli(*args: str) -> dict[str, object] | subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, "-m", "rsi_harness", *args],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cases = [
+                ("py_repo", {"pyproject.toml": "[project]\nname='x'\n"}, "python", "unittest"),
+                ("node_repo", {"package.json": json.dumps({"scripts": {"test": "node --test"}})}, "javascript", "npm"),
+                ("rust_repo", {"Cargo.toml": "[package]\nname='x'\nversion='0.1.0'\n"}, "rust", "cargo"),
+                ("go_repo", {"go.mod": "module example.com/x\n"}, "go", "go"),
+            ]
+            for name, files, exp_lang, exp_tool in cases:
+                rdir = root / name
+                rdir.mkdir()
+                for fname, content in files.items():
+                    (rdir / fname).write_text(content, encoding="utf-8")
+                if name == "py_repo":
+                    (rdir / "tests").mkdir()
+
+                proc = _run_cli("init", "--repo", str(rdir), "--dry-run", "--json")
+                data = json.loads(proc.stdout)
+                self.assertTrue(data["dry_run"])
+                self.assertEqual(data["toolchain"]["language"], exp_lang)
+                self.assertEqual(data["toolchain"]["tool"], exp_tool)
+                self.assertFalse((rdir / "harness.yaml").exists())
+                self.assertFalse((rdir / "rsi.config.json").exists())
+
+            # Live init + non-clobbering re-init
+            work = root / "py_repo"
+            (work / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
+            proc_live = _run_cli("init", "--repo", str(work), "--runtime", "claude", "--json")
+            live_data = json.loads(proc_live.stdout)
+            self.assertEqual(live_data["runtime"], "claude")
+            self.assertTrue((work / "harness.yaml").is_file())
+            self.assertTrue((work / "rsi.config.json").is_file())
+            self.assertTrue((work / "AGENTS.md").is_file())
+            gi_text = (work / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn("*.pyc", gi_text)
+            self.assertIn(".rsi/", gi_text)
+
+            # User edits AGENTS.md & .gitignore; second init without --force preserves them
+            (work / "AGENTS.md").write_text("# Custom user rules\n", encoding="utf-8")
+            proc_again = _run_cli("init", "--repo", str(work), "--json")
+            again_data = json.loads(proc_again.stdout)
+            self.assertTrue(all(a["action"] == "skip" for a in again_data["actions"]))
+            self.assertEqual((work / "AGENTS.md").read_text(encoding="utf-8"), "# Custom user rules\n")
+
+            # Seed git + run status, mine, evolve --pr-dry-run, and lineage
+            subprocess.run(["git", "init", "-b", "main"], cwd=work, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "RSI"], cwd=work, check=True)
+            subprocess.run(["git", "config", "user.email", "rsi@example.com"], cwd=work, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=work, check=True, capture_output=True)
+
+            st_pre = json.loads(_run_cli("status", "--repo", str(work), "--json").stdout)
+            self.assertEqual(st_pre["evolution"]["total_cycles"], 0)
+            self.assertEqual(st_pre["runtime"], "claude")
+
+            manifest = root / "tasks.json"
+            shutil.copy2(REPO_ROOT / "benchmarks" / "tasks.json", manifest)
+            ev_proc = _run_cli(
+                "evolve",
+                "--repo",
+                str(work),
+                "--runner",
+                "mock",
+                "--manifest",
+                str(manifest),
+                "--pr-dry-run",
+            )
+            ev_data = json.loads(ev_proc.stdout)
+            self.assertTrue(ev_data["accepted"], ev_data)
+            self.assertTrue(Path(ev_data["pr_report_path"]).is_file())
+
+            st_post = json.loads(_run_cli("status", "--repo", str(work), "--json").stdout)
+            self.assertEqual(st_post["evolution"]["accepted_cycles"], 1)
+            self.assertEqual(len(st_post["pr_reports"]), 1)
+
+            lin_data = json.loads(_run_cli("lineage", "--repo", str(work), "--pareto", "--json").stdout)
+            self.assertGreaterEqual(len(lin_data), 1)
+
+            mine_data = json.loads(_run_cli("mine", "--repo", str(work), "--json").stdout)
+            self.assertIn("cluster_count", mine_data)
 
 
 if __name__ == "__main__":

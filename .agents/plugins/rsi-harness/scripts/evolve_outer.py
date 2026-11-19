@@ -51,6 +51,7 @@ from interfaces import (  # noqa: E402
     load_plugin,
 )
 from lineage import LineageArchive  # noqa: E402
+from pr_reporter import create_review_pr  # noqa: E402
 try:
     from run_bench import load_benchmark_suite  # noqa: E402
 except ImportError:
@@ -603,6 +604,36 @@ def _run_bench_in_repo(
     return json.loads(proc.stdout)
 
 
+def _maybe_handle_pr(
+    repo: Path,
+    record: dict[str, Any],
+    *,
+    pr_mode: str,
+    pr_base: str,
+    diff_text: str | None = None,
+) -> None:
+    if pr_mode == "none":
+        return
+    if pr_mode == "dry-run":
+        pr_res = create_review_pr(repo, record, base_branch=pr_base, dry_run=True, diff_text=diff_text)
+        record["pr_result"] = pr_res
+        record["pr_report_path"] = pr_res["report_path"]
+    elif pr_mode == "create":
+        if not record.get("accepted"):
+            record["pr_result"] = {
+                "dry_run": False,
+                "created": False,
+                "skipped": True,
+                "reason": "candidate_not_accepted",
+            }
+            return
+        pr_res = create_review_pr(repo, record, base_branch=pr_base, dry_run=False, diff_text=diff_text)
+        record["pr_result"] = pr_res
+        record["pr_report_path"] = pr_res["report_path"]
+    else:
+        raise ValueError(f"Unsupported pr_mode: {pr_mode!r}")
+
+
 def run_evolution_cycle(
     repo_root: Path,
     branch: str = "rsi/evolved",
@@ -617,6 +648,8 @@ def run_evolution_cycle(
     proposer: Proposer | str | dict[str, Any] | None = None,
     evaluator: Evaluator | str | dict[str, Any] | None = None,
     critic: Critic | str | dict[str, Any] | None = None,
+    pr_mode: str = "none",
+    pr_base: str = "main",
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
@@ -675,6 +708,7 @@ def run_evolution_cycle(
                 "reasons": ["no_weakness_clusters_found"],
                 "mined_clusters": [],
             }
+            _maybe_handle_pr(repo, record, pr_mode=pr_mode, pr_base=pr_base, diff_text=None)
             append_jsonl(history_path, record)
             return record
         mined_clusters = [asdict(c) for c in clusters[:5]]
@@ -864,6 +898,7 @@ def run_evolution_cycle(
                 "store_dir": gen_rec["snapshot_dir"],
                 **prop_meta,
             }
+            _maybe_handle_pr(repo, record, pr_mode=pr_mode, pr_base=pr_base, diff_text=diff_text)
             append_jsonl(history_path, record)
             return record
 
@@ -1004,6 +1039,7 @@ def run_evolution_cycle(
             "store_dir": gen_rec["snapshot_dir"],
             **prop_meta,
         }
+        _maybe_handle_pr(repo, record, pr_mode=pr_mode, pr_base=pr_base, diff_text=diff_text)
         append_jsonl(history_path, record)
         return record
     finally:
@@ -1050,8 +1086,24 @@ def main() -> None:
         choices=["leak", "budget", "protected"],
         help="Optional negative test mode for mock proposer",
     )
+    parser.add_argument(
+        "--pr-dry-run",
+        action="store_true",
+        help="Generate evidence-backed PR report under .rsi/pr_reports/ without pushing",
+    )
+    parser.add_argument(
+        "--create-pr",
+        action="store_true",
+        help="Push accepted evolution branch and open a PR via gh CLI",
+    )
+    parser.add_argument(
+        "--pr-base",
+        default="main",
+        help="Base branch for PR report/creation",
+    )
     args = parser.parse_args()
 
+    pr_mode = "create" if args.create_pr else ("dry-run" if args.pr_dry_run else "none")
     result = run_evolution_cycle(
         Path(args.repo),
         branch=args.branch,
@@ -1063,6 +1115,8 @@ def main() -> None:
         parent_strategy=args.parent_strategy,
         parent_node_id=args.parent_node_id,
         seed=args.seed,
+        pr_mode=pr_mode,
+        pr_base=args.pr_base,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
