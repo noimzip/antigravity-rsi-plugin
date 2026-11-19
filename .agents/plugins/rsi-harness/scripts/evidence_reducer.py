@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 ERROR_LINE_RE = re.compile(
-    r"(ERROR|FAIL|FAILED|Exception|Traceback|AssertionError|KeyError|ValueError|SyntaxError)",
+    r"("
+    r"ERROR|FAIL|FAILED|Exception|Traceback|AssertionError|KeyError|ValueError|TypeError|"
+    r"ImportError|ModuleNotFoundError|SyntaxError|ReferenceError|RangeError|"
+    r"TS\d{4}:|FAIL\s+|Expected:|Received:|npm ERR!|✕|×|"
+    r"error\[E\d{4}\]:|^error:|thread '.*' panicked at|test .* \.\.\. FAILED|assertion .* failed|"
+    r"--- FAIL:|FAIL\t|panic:|\.go:\d+(?::\d+)?:|"
+    r"Exception in thread|Caused by:|java\.[\w.]+Exception|\[ERROR\]|Tests run:.*Failures: [1-9]|"
+    r":\d+:\d+: (?:fatal )?error:|undefined reference to|Segmentation fault|Sanitizer"
+    r")",
     re.IGNORECASE,
 )
 

@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "inner_check_cmd": "python3 -m unittest discover -s tests",
+    "inner_check_cmd": "auto",
+    "inner_check_timeout_sec": None,
     "max_inner_retries": 2,
     "evidence_max_chars": 10000,
     "reducer": {
