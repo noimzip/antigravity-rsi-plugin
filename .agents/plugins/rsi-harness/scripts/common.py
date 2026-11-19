@@ -14,8 +14,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "rrsi": {
         "max_files": 2,
         "max_diff_lines": 80,
+        "n_trials": 1,
+        "noise_z": 1.96,
         "min_pass_rate_gain": 0.05,
         "min_token_reduction_ratio": 0.1,
+        "min_latency_reduction_ratio": 0.1,
+        "max_token_overhead_ratio": 0.15,
+        "max_latency_overhead_ratio": 0.25,
+        "pareto_tie_epsilon": 0.005,
         "max_rules_bytes": 24000,
         "editable_prefixes": [
             ".agents/plugins/rsi-harness/rules/",

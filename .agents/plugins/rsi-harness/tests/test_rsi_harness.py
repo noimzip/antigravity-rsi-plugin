@@ -18,8 +18,13 @@ REPO_ROOT = PLUGIN_DIR.parents[2]
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+from common import load_jsonl, load_rsi_config  # noqa: E402
 from evidence_reducer import reduce_log  # noqa: E402
-from evolve_outer import run_evolution_cycle  # noqa: E402
+from evolve_outer import (  # noqa: E402
+    compute_selection_diagnostics,
+    evaluate_selection_gate,
+    run_evolution_cycle,
+)
 from guard_harness import evaluate_tool_guard  # noqa: E402
 from inner_gate import evaluate_stop  # noqa: E402
 from trace_collector import record_event  # noqa: E402
@@ -397,6 +402,15 @@ class OuterLoopTests(unittest.TestCase):
             self.assertEqual(main_before, main_after)
             self.assertEqual(evolved_sha, ok_res["commit_sha"])
 
+            # History records multi-trial stats and selection diagnostics
+            history_records = load_jsonl(repo / ".rsi" / "evolution_history.jsonl")
+            last_rec = history_records[-1]
+            self.assertEqual(last_rec["n_trials"], 3)
+            self.assertEqual(last_rec["baseline"]["n_trials"], 3)
+            self.assertIn("stats", last_rec["baseline"])
+            self.assertIn("stats", last_rec["candidate"])
+            self.assertIn("selection_diagnostics", last_rec)
+
     def test_materialize_task_writes_task_rsi_config(self) -> None:
         sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
         from run_bench import _materialize_task  # noqa: E402
@@ -408,6 +422,132 @@ class OuterLoopTests(unittest.TestCase):
             _materialize_task(tasks["tasks"][0], dest, REPO_ROOT)
             cfg = json.loads((dest / "rsi.config.json").read_text(encoding="utf-8"))
             self.assertIn("test_*.py", cfg["inner_check_cmd"])
+
+    def test_multi_trial_benchmark_stats_aggregation(self) -> None:
+        sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
+        from run_bench import run_benchmark, summarize_series  # noqa: E402
+
+        s = summarize_series([100.0, 110.0, 120.0])
+        self.assertEqual(s["n"], 3)
+        self.assertAlmostEqual(s["mean"], 110.0)
+        self.assertAlmostEqual(s["std"], 10.0)
+        self.assertAlmostEqual(s["median"], 110.0)
+        self.assertGreater(s["iqr"], 0.0)
+        self.assertGreater(s["ci95_half_width"], 0.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            export_dir = Path(tmp) / "traces"
+            report = run_benchmark(
+                REPO_ROOT,
+                REPO_ROOT / "benchmarks" / "tasks.json",
+                runner="mock",
+                trace_export_dir=export_dir,
+                n_trials=3,
+            )
+            self.assertEqual(report["n_trials"], 3)
+            self.assertEqual(len(report["trials"]), 3)
+            for metric in ("pass_rate", "total_tokens", "duration_sec"):
+                self.assertIn(metric, report["stats"])
+                for key in ("n", "mean", "std", "se", "median", "iqr", "ci95_half_width"):
+                    self.assertIn(key, report["stats"][metric])
+            self.assertEqual(len(list(export_dir.glob("*/summary.json"))), 3)
+            self.assertEqual(len(list(export_dir.glob("*/trial_3.json"))), 3)
+
+    def test_variance_aware_pareto_selection_gate(self) -> None:
+        cfg = load_rsi_config(REPO_ROOT)
+
+        # 1. Noisy 10% token drop with 12% std (N=3) at 100% pass rate -> rejected
+        noisy_base = {
+            "pass_rate": 1.0,
+            "total_tokens": 10000,
+            "duration_sec": 10.0,
+            "n_trials": 3,
+            "stats": {
+                "pass_rate": {"mean": 1.0, "std": 0.0, "n": 3},
+                "total_tokens": {"mean": 10000.0, "std": 1200.0, "n": 3},
+                "duration_sec": {"mean": 10.0, "std": 0.2, "n": 3},
+            },
+        }
+        noisy_cand = {
+            "pass_rate": 1.0,
+            "total_tokens": 9000,
+            "duration_sec": 10.0,
+            "n_trials": 3,
+            "stats": {
+                "pass_rate": {"mean": 1.0, "std": 0.0, "n": 3},
+                "total_tokens": {"mean": 9000.0, "std": 1200.0, "n": 3},
+                "duration_sec": {"mean": 10.0, "std": 0.2, "n": 3},
+            },
+        }
+        ok_noisy, reasons_noisy = evaluate_selection_gate(noisy_base, noisy_cand, cfg)
+        self.assertFalse(ok_noisy)
+        self.assertTrue(any("noisy_variance_exceeds_gain" in r for r in reasons_noisy))
+
+        # 2. Consistent 12% token drop with 1% std (N=3) at 100% pass rate -> accepted
+        stable_base = {
+            "pass_rate": 1.0,
+            "total_tokens": 10000,
+            "duration_sec": 10.0,
+            "n_trials": 3,
+            "stats": {
+                "pass_rate": {"mean": 1.0, "std": 0.0, "n": 3},
+                "total_tokens": {"mean": 10000.0, "std": 100.0, "n": 3},
+                "duration_sec": {"mean": 10.0, "std": 0.1, "n": 3},
+            },
+        }
+        stable_cand = {
+            "pass_rate": 1.0,
+            "total_tokens": 8800,
+            "duration_sec": 9.8,
+            "n_trials": 3,
+            "stats": {
+                "pass_rate": {"mean": 1.0, "std": 0.0, "n": 3},
+                "total_tokens": {"mean": 8800.0, "std": 100.0, "n": 3},
+                "duration_sec": {"mean": 9.8, "std": 0.1, "n": 3},
+            },
+        }
+        ok_stable, reasons_stable = evaluate_selection_gate(stable_base, stable_cand, cfg)
+        self.assertTrue(ok_stable, msg=str(reasons_stable))
+        self.assertTrue(any("token_efficiency_improved" in r for r in reasons_stable))
+
+        # 3. Consistent 20% latency drop with flat tokens at 100% pass rate -> accepted
+        lat_cand = {
+            "pass_rate": 1.0,
+            "total_tokens": 10000,
+            "duration_sec": 8.0,
+            "n_trials": 3,
+            "stats": {
+                "pass_rate": {"mean": 1.0, "std": 0.0, "n": 3},
+                "total_tokens": {"mean": 10000.0, "std": 50.0, "n": 3},
+                "duration_sec": {"mean": 8.0, "std": 0.2, "n": 3},
+            },
+        }
+        ok_lat, reasons_lat = evaluate_selection_gate(stable_base, lat_cand, cfg)
+        self.assertTrue(ok_lat, msg=str(reasons_lat))
+        self.assertTrue(any("latency_efficiency_improved" in r for r in reasons_lat))
+
+        # 4. Pass-rate regression -> rejected
+        reg_cand = {**stable_cand, "pass_rate": 0.66, "stats": {**stable_cand["stats"], "pass_rate": {"mean": 0.66, "std": 0.0, "n": 3}}}
+        ok_reg, reasons_reg = evaluate_selection_gate(stable_base, reg_cand, cfg)
+        self.assertFalse(ok_reg)
+        self.assertTrue(any("pass_rate_regressed" in r for r in reasons_reg))
+
+        # 5. Noisy pass-rate bump below noise_z * se_rate -> rejected
+        noisy_rate_base = {
+            "pass_rate": 0.70,
+            "total_tokens": 5000,
+            "n_trials": 3,
+            "stats": {"pass_rate": {"mean": 0.70, "std": 0.15, "n": 3}, "total_tokens": {"mean": 5000, "std": 50, "n": 3}},
+        }
+        noisy_rate_cand = {
+            "pass_rate": 0.78,
+            "total_tokens": 5000,
+            "n_trials": 3,
+            "stats": {"pass_rate": {"mean": 0.78, "std": 0.15, "n": 3}, "total_tokens": {"mean": 5000, "std": 50, "n": 3}},
+        }
+        diag = compute_selection_diagnostics(noisy_rate_base, noisy_rate_cand, cfg)
+        self.assertFalse(diag["accepted"])
+        self.assertTrue(any("noisy_variance_exceeds_gain" in r for r in diag["reasons"]))
 
 
 if __name__ == "__main__":

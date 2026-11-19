@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
+import statistics
 import subprocess
 import tempfile
 import time
@@ -144,6 +146,53 @@ def _run_agy_task(prompt: str, task_dir: Path, timeout_sec: int = 120) -> tuple[
     return tokens, raw[:500]
 
 
+def summarize_series(values: list[float]) -> dict[str, float]:
+    """Compute mean, sample std, SE, median, IQR, min/max, and 95% CI half-width."""
+    n = len(values)
+    if n == 0:
+        return {
+            "n": 0,
+            "mean": 0.0,
+            "std": 0.0,
+            "se": 0.0,
+            "median": 0.0,
+            "iqr": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "ci95_half_width": 0.0,
+        }
+    floats = [float(v) for v in values]
+    mean = statistics.mean(floats)
+    std = statistics.stdev(floats) if n >= 2 else 0.0
+    se = std / math.sqrt(n)
+    median = statistics.median(floats)
+    if n >= 2:
+        q25, _, q75 = statistics.quantiles(floats, n=4, method="inclusive")
+        iqr = q75 - q25
+    else:
+        iqr = 0.0
+    return {
+        "n": n,
+        "mean": round(mean, 6),
+        "std": round(std, 6),
+        "se": round(se, 6),
+        "median": round(median, 6),
+        "iqr": round(iqr, 6),
+        "min": round(min(floats), 6),
+        "max": round(max(floats), 6),
+        "ci95_half_width": round(1.96 * se, 6),
+    }
+
+
+def aggregate_trial_metrics(trials: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate summary statistics across multiple benchmark trials."""
+    return {
+        "pass_rate": summarize_series([float(t.get("pass_rate", 0.0)) for t in trials]),
+        "total_tokens": summarize_series([float(t.get("total_tokens", 0)) for t in trials]),
+        "duration_sec": summarize_series([float(t.get("duration_sec", 0.0)) for t in trials]),
+    }
+
+
 def _export_task_traces(
     task_dir: Path,
     task_id: str,
@@ -151,6 +200,9 @@ def _export_task_traces(
     tokens: int,
     passed: bool,
     export_dir: Path | None,
+    *,
+    trial_idx: int = 1,
+    n_trials: int = 1,
 ) -> None:
     """Copy task `.rsi/traces/*` (or emit mock trace) into ``export_dir``."""
     if export_dir is None:
@@ -161,7 +213,22 @@ def _export_task_traces(
     if src_traces.is_dir():
         for conv_dir in src_traces.iterdir():
             if conv_dir.is_dir():
-                shutil.copytree(conv_dir, export_dir / conv_dir.name, dirs_exist_ok=True)
+                dst_conv = export_dir / conv_dir.name
+                shutil.copytree(conv_dir, dst_conv, dirs_exist_ok=True)
+                if n_trials > 1:
+                    (dst_conv / f"trial_{trial_idx}.json").write_text(
+                        json.dumps(
+                            {
+                                "trial": trial_idx,
+                                "task_id": task_id,
+                                "tokens": tokens,
+                                "passed": passed,
+                            },
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
                 copied = True
     if not copied and runner == "mock":
         mock_dir = export_dir / f"mock-{task_id}"
@@ -178,19 +245,31 @@ def _export_task_traces(
             + "\n",
             encoding="utf-8",
         )
+        if n_trials > 1:
+            (mock_dir / f"trial_{trial_idx}.json").write_text(
+                json.dumps(
+                    {
+                        "trial": trial_idx,
+                        "task_id": task_id,
+                        "tokens": tokens,
+                        "passed": passed,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
 
-def run_benchmark(
+def _run_single_trial(
     repo_root: Path,
-    manifest_path: Path,
-    runner: str = "mock",
-    trace_export_dir: Path | None = None,
+    tasks: list[dict[str, Any]],
+    rules_text: str,
+    runner: str,
+    trace_export_dir: Path | None,
+    trial_idx: int,
+    n_trials: int,
 ) -> dict[str, Any]:
-    """Execute benchmark suite in isolated temp directories and return metrics."""
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    rules_text = _load_rules_text(repo_root)
-    tasks = manifest.get("tasks", [])
-
     results: list[dict[str, Any]] = []
     passed_count = 0
     total_tokens = 0
@@ -221,7 +300,14 @@ def run_benchmark(
             total_tokens += tokens
 
             _export_task_traces(
-                task_dir, task_id, runner, tokens, passed, trace_export_dir
+                task_dir,
+                task_id,
+                runner,
+                tokens,
+                passed,
+                trace_export_dir,
+                trial_idx=trial_idx,
+                n_trials=n_trials,
             )
 
             results.append(
@@ -236,8 +322,7 @@ def run_benchmark(
 
     total = len(tasks)
     return {
-        "suite": manifest.get("suite_name", "mini-bench"),
-        "runner": runner,
+        "trial": trial_idx,
         "total_tasks": total,
         "passed_tasks": passed_count,
         "pass_rate": round(passed_count / total, 4) if total else 0.0,
@@ -247,17 +332,72 @@ def run_benchmark(
     }
 
 
+def run_benchmark(
+    repo_root: Path,
+    manifest_path: Path,
+    runner: str = "mock",
+    trace_export_dir: Path | None = None,
+    n_trials: int = 1,
+) -> dict[str, Any]:
+    """Execute benchmark suite over ``n_trials`` isolated runs and aggregate metrics."""
+    if n_trials < 1:
+        raise ValueError(f"n_trials must be >= 1, got {n_trials}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rules_text = _load_rules_text(repo_root)
+    tasks = manifest.get("tasks", [])
+
+    trials: list[dict[str, Any]] = []
+    for trial_idx in range(1, n_trials + 1):
+        trials.append(
+            _run_single_trial(
+                repo_root,
+                tasks,
+                rules_text,
+                runner,
+                trace_export_dir,
+                trial_idx=trial_idx,
+                n_trials=n_trials,
+            )
+        )
+
+    stats = aggregate_trial_metrics(trials)
+    mean_passed = statistics.mean(float(t["passed_tasks"]) for t in trials) if trials else 0.0
+    total = len(tasks)
+    return {
+        "suite": manifest.get("suite_name", "mini-bench"),
+        "runner": runner,
+        "n_trials": n_trials,
+        "total_tasks": total,
+        "passed_tasks": int(round(mean_passed)),
+        "pass_rate": round(stats["pass_rate"]["mean"], 4),
+        "total_tokens": int(round(stats["total_tokens"]["mean"])),
+        "duration_sec": round(stats["duration_sec"]["mean"], 3),
+        "stats": stats,
+        "trials": trials,
+        "tasks": trials[-1]["tasks"] if trials else [],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run RSI-Harness mini benchmark.")
     parser.add_argument("--repo", default=".", help="Repository root containing candidate harness")
     parser.add_argument("--manifest", default="benchmarks/tasks.json", help="Benchmark tasks JSON")
     parser.add_argument("--runner", default="mock", choices=["mock", "agy"])
     parser.add_argument(
+        "--trials",
+        type=int,
+        default=1,
+        help="Number of repeated benchmark trials for variance aggregation (>= 1)",
+    )
+    parser.add_argument(
         "--trace-export-dir",
         default=None,
         help="Optional directory to preserve per-task .rsi/traces before temp cleanup",
     )
     args = parser.parse_args()
+    if args.trials < 1:
+        parser.error("--trials must be >= 1")
 
     repo_root = Path(args.repo).resolve()
     manifest_path = Path(args.manifest)
@@ -270,6 +410,7 @@ def main() -> None:
         manifest_path,
         runner=args.runner,
         trace_export_dir=trace_export_dir,
+        n_trials=args.trials,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

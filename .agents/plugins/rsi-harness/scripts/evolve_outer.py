@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -241,43 +242,148 @@ def validate_proposal_rrsi(
     return len(reasons) == 0, reasons, meta
 
 
+def _extract_metric(report: dict[str, Any], key: str) -> tuple[float, float, float, int]:
+    """Return ``(mean, std, se, n)`` from multi-trial ``stats`` or scalar report fields."""
+    n_default = max(1, int(report.get("n_trials", 1)))
+    stats = report.get("stats")
+    if isinstance(stats, dict) and isinstance(stats.get(key), dict):
+        entry = stats[key]
+        mean = float(entry.get("mean", report.get(key, 0.0)))
+        std = float(entry.get("std", 0.0))
+        n = max(1, int(entry.get("n", n_default)))
+        se = float(entry["se"]) if "se" in entry else (std / math.sqrt(n))
+        return mean, std, se, n
+    return float(report.get(key, 0.0)), 0.0, 0.0, n_default
+
+
+def compute_selection_diagnostics(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate candidate vs baseline using variance-aware Pareto dominance & noise floors."""
+    rrsi = config.get("rrsi", {})
+    min_gain = float(rrsi.get("min_pass_rate_gain", 0.05))
+    min_tok_red = float(rrsi.get("min_token_reduction_ratio", 0.1))
+    min_lat_red = float(rrsi.get("min_latency_reduction_ratio", 0.1))
+    max_tok_overhead = float(rrsi.get("max_token_overhead_ratio", 0.15))
+    max_lat_overhead = float(rrsi.get("max_latency_overhead_ratio", 0.25))
+    noise_z = float(rrsi.get("noise_z", 1.96))
+    eps = float(rrsi.get("pareto_tie_epsilon", 0.005))
+
+    b_rate, b_rate_std, b_rate_se, b_n = _extract_metric(baseline, "pass_rate")
+    c_rate, c_rate_std, c_rate_se, c_n = _extract_metric(candidate, "pass_rate")
+    b_tok, b_tok_std, b_tok_se, _ = _extract_metric(baseline, "total_tokens")
+    c_tok, c_tok_std, c_tok_se, _ = _extract_metric(candidate, "total_tokens")
+    b_lat, b_lat_std, b_lat_se, _ = _extract_metric(baseline, "duration_sec")
+    c_lat, c_lat_std, c_lat_se, _ = _extract_metric(candidate, "duration_sec")
+
+    rate_gain = c_rate - b_rate
+    tok_reduction = ((b_tok - c_tok) / b_tok) if b_tok > 0 else 0.0
+    lat_reduction = ((b_lat - c_lat) / b_lat) if b_lat > 0 else 0.0
+
+    se_rate = math.hypot(b_rate_se, c_rate_se)
+    se_tok = math.hypot(b_tok_se, c_tok_se)
+    se_lat = math.hypot(b_lat_se, c_lat_se)
+
+    rate_noise_floor = noise_z * se_rate
+    eff_min_rate_gain = max(min_gain, rate_noise_floor)
+    tok_noise_floor = noise_z * se_tok
+    eff_min_tok_delta = max(b_tok * min_tok_red, tok_noise_floor)
+    lat_noise_floor = noise_z * se_lat
+    eff_min_lat_delta = max(b_lat * min_lat_red, lat_noise_floor)
+
+    tok_cap = int(b_tok * (1.0 + max_tok_overhead)) if b_tok > 0 else 0
+    if c_rate < b_rate - eps:
+        accepted = False
+        reasons = [f"pass_rate_regressed:{c_rate:.3f}<{b_rate:.3f}"]
+    elif b_tok > 0 and c_tok > tok_cap:
+        accepted = False
+        reasons = [f"token_overhead_too_high:{int(round(c_tok))}>{tok_cap}"]
+    elif rate_gain >= eff_min_rate_gain:
+        accepted = True
+        reasons = [f"pass_rate_improved:+{rate_gain:.3f}"]
+    elif (
+        c_rate >= b_rate - eps
+        and b_tok > 0
+        and (b_tok - c_tok) >= eff_min_tok_delta
+        and (b_lat <= 0 or c_lat <= b_lat * (1.0 + max_lat_overhead))
+    ):
+        accepted = True
+        reasons = [f"token_efficiency_improved:-{tok_reduction * 100:.1f}%"]
+    elif (
+        c_rate >= b_rate - eps
+        and b_lat > 0
+        and (b_lat - c_lat) >= eff_min_lat_delta
+        and (b_tok <= 0 or c_tok <= b_tok + tok_noise_floor)
+    ):
+        accepted = True
+        reasons = [f"latency_efficiency_improved:-{lat_reduction * 100:.1f}%"]
+    else:
+        accepted = False
+        raw_met_fixed = (
+            (rate_gain >= min_gain)
+            or (c_rate >= b_rate - eps and b_tok > 0 and tok_reduction >= min_tok_red)
+            or (c_rate >= b_rate - eps and b_lat > 0 and lat_reduction >= min_lat_red)
+        )
+        if raw_met_fixed:
+            reasons = [
+                f"noisy_variance_exceeds_gain:rate_delta={rate_gain:.3f},"
+                f"token_reduction={tok_reduction:.3f},latency_reduction={lat_reduction:.3f}"
+            ]
+        else:
+            reasons = [
+                f"insufficient_gain:rate_delta={rate_gain:.3f},token_reduction={tok_reduction:.3f}"
+            ]
+
+    return {
+        "accepted": accepted,
+        "reasons": reasons,
+        "baseline_n": b_n,
+        "candidate_n": c_n,
+        "rate_gain": round(rate_gain, 6),
+        "tok_reduction": round(tok_reduction, 6),
+        "lat_reduction": round(lat_reduction, 6),
+        "baseline_std": {"pass_rate": round(b_rate_std, 6), "total_tokens": round(b_tok_std, 6), "duration_sec": round(b_lat_std, 6)},
+        "candidate_std": {"pass_rate": round(c_rate_std, 6), "total_tokens": round(c_tok_std, 6), "duration_sec": round(c_lat_std, 6)},
+        "se_rate": round(se_rate, 6),
+        "se_tok": round(se_tok, 6),
+        "se_lat": round(se_lat, 6),
+        "rate_noise_floor": round(rate_noise_floor, 6),
+        "tok_noise_floor": round(tok_noise_floor, 6),
+        "lat_noise_floor": round(lat_noise_floor, 6),
+        "eff_min_rate_gain": round(eff_min_rate_gain, 6),
+        "eff_min_tok_delta": round(eff_min_tok_delta, 6),
+        "eff_min_lat_delta": round(eff_min_lat_delta, 6),
+    }
+
+
 def evaluate_selection_gate(
     baseline: dict[str, Any],
     candidate: dict[str, Any],
     config: dict[str, Any],
 ) -> tuple[bool, list[str]]:
-    """Apply RRSI Noise-Adjusted Floor + SoL-Pi Token Cost Gate."""
-    rrsi = config.get("rrsi", {})
-    min_gain = float(rrsi.get("min_pass_rate_gain", 0.05))
-    min_tok_red = float(rrsi.get("min_token_reduction_ratio", 0.1))
-
-    base_rate = float(baseline.get("pass_rate", 0.0))
-    cand_rate = float(candidate.get("pass_rate", 0.0))
-    base_tok = int(baseline.get("total_tokens", 0))
-    cand_tok = int(candidate.get("total_tokens", 0))
-
-    rate_gain = cand_rate - base_rate
-    tok_reduction = ((base_tok - cand_tok) / base_tok) if base_tok > 0 else 0.0
-
-    if rate_gain >= min_gain:
-        if base_tok > 0 and cand_tok > int(base_tok * 1.15):
-            return False, [f"token_overhead_too_high:{cand_tok}>{int(base_tok * 1.15)}"]
-        return True, [f"pass_rate_improved:+{rate_gain:.3f}"]
-
-    if cand_rate >= base_rate and tok_reduction >= min_tok_red:
-        return True, [f"token_efficiency_improved:-{tok_reduction * 100:.1f}%"]
-
-    return False, [
-        f"insufficient_gain:rate_delta={rate_gain:.3f},token_reduction={tok_reduction:.3f}"
-    ]
+    """Apply RRSI Noise-Adjusted Floor + SoL-Pi Pareto Selection Gate."""
+    diag = compute_selection_diagnostics(baseline, candidate, config)
+    return bool(diag["accepted"]), list(diag["reasons"])
 
 
 def _run_bench_in_repo(
     repo_path: Path,
     runner: str,
     trace_export_dir: Path | None = None,
+    n_trials: int = 1,
 ) -> dict[str, Any]:
-    cmd = ["python3", "benchmarks/run_bench.py", "--repo", ".", "--runner", runner]
+    cmd = [
+        "python3",
+        "benchmarks/run_bench.py",
+        "--repo",
+        ".",
+        "--runner",
+        runner,
+        "--trials",
+        str(max(1, n_trials)),
+    ]
     if trace_export_dir is not None:
         cmd.extend(["--trace-export-dir", str(trace_export_dir)])
     proc = subprocess.run(
@@ -300,6 +406,7 @@ def run_evolution_cycle(
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
     config = load_rsi_config(repo)
+    n_trials = max(1, int(config.get("rrsi", {}).get("n_trials", 1)))
     history_path = repo / ".rsi" / "evolution_history.jsonl"
     history = load_jsonl(history_path)
     trace_ctx = _collect_trace_context(repo)
@@ -319,7 +426,10 @@ def run_evolution_cycle(
         _seed_worktree_traces(repo, worktree_dir)
         wt_traces_dir = worktree_dir / ".rsi" / "traces"
         baseline_report = _run_bench_in_repo(
-            worktree_dir, runner=runner, trace_export_dir=wt_traces_dir
+            worktree_dir,
+            runner=runner,
+            trace_export_dir=wt_traces_dir,
+            n_trials=n_trials,
         )
         # Persist exported baseline traces back into main repo's ignored .rsi/traces/
         # and refresh trace_ctx so Proposer sees the real baseline execution traces.
@@ -343,6 +453,7 @@ def run_evolution_cycle(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "run_id": run_id,
                 "branch": branch,
+                "n_trials": n_trials,
                 "accepted": False,
                 "stage": "proposal_critic",
                 "reasons": prop_reasons,
@@ -354,8 +465,10 @@ def run_evolution_cycle(
             append_jsonl(history_path, record)
             return record
 
-        candidate_report = _run_bench_in_repo(worktree_dir, runner=runner)
-        sel_ok, sel_reasons = evaluate_selection_gate(baseline_report, candidate_report, config)
+        candidate_report = _run_bench_in_repo(worktree_dir, runner=runner, n_trials=n_trials)
+        sel_diag = compute_selection_diagnostics(baseline_report, candidate_report, config)
+        sel_ok = bool(sel_diag["accepted"])
+        sel_reasons = list(sel_diag["reasons"])
 
         commit_sha = None
         if sel_ok:
@@ -373,10 +486,12 @@ def run_evolution_cycle(
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": run_id,
             "branch": branch,
+            "n_trials": n_trials,
             "accepted": sel_ok,
             "commit_sha": commit_sha,
             "stage": "selection_gate",
             "reasons": sel_reasons,
+            "selection_diagnostics": sel_diag,
             "proposer_note": proposer_note,
             "baseline": baseline_report,
             "candidate": candidate_report,
