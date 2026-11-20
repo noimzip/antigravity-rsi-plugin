@@ -119,9 +119,28 @@ def _materialize_task(task: dict[str, Any], dest: Path, repo_root: Path) -> dict
                 shutil.copytree(
                     src_dir,
                     dest,
-                    ignore=shutil.ignore_patterns(".git", ".rsi", "__pycache__", ".pytest_cache"),
+                    ignore=shutil.ignore_patterns(
+                        ".git",
+                        ".rsi",
+                        "__pycache__",
+                        ".pytest_cache",
+                        "node_modules",
+                        "vendor",
+                        ".venv",
+                        "venv",
+                        "target",
+                        "dist",
+                        "build",
+                    ),
+                    symlinks=True,
+                    ignore_dangling_symlinks=True,
                     dirs_exist_ok=True,
                 )
+                for dep_dir in ("node_modules", "vendor", ".venv", "venv", "target"):
+                    src_dep = src_dir / dep_dir
+                    dst_dep = dest / dep_dir
+                    if src_dep.exists() and not dst_dep.exists():
+                        os.symlink(src_dep.resolve(), dst_dep, target_is_directory=True)
 
         if env_cfg.get("git_repo"):
             raw_repo = str(env_cfg["git_repo"])

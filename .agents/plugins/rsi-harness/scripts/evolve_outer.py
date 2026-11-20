@@ -26,7 +26,31 @@ from pathlib import Path
 from typing import Any
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
-BENCHMARKS_DIR = SCRIPTS_DIR.parents[3] / "benchmarks"
+
+
+def _resolve_benchmarks_dir() -> Path:
+    env_dir = os.environ.get("RSI_BENCHMARKS_DIR", "").strip()
+    if env_dir:
+        cand = Path(env_dir).resolve()
+        if (cand / "run_bench.py").is_file():
+            return cand
+    local = SCRIPTS_DIR.parents[3] / "benchmarks"
+    if (local / "run_bench.py").is_file():
+        return local
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("rsi_harness")
+        if spec and spec.origin:
+            pkg_bench = Path(spec.origin).resolve().parents[1] / "benchmarks"
+            if (pkg_bench / "run_bench.py").is_file():
+                return pkg_bench
+    except Exception:
+        pass
+    return local
+
+
+BENCHMARKS_DIR = _resolve_benchmarks_dir()
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 if BENCHMARKS_DIR.is_dir() and str(BENCHMARKS_DIR) not in sys.path:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -13,17 +14,26 @@ from typing import Any
 
 
 def _ensure_scripts_on_path(repo_root: Path | None = None) -> Path:
-    candidates: list[Path] = []
+    pkg_root = Path(__file__).resolve().parents[1]
+    pkg_bench = pkg_root / "benchmarks"
+    if (pkg_bench / "run_bench.py").is_file():
+        os.environ.setdefault("RSI_BENCHMARKS_DIR", str(pkg_bench))
+        if str(pkg_bench) not in sys.path:
+            sys.path.insert(0, str(pkg_bench))
+
+    candidates: list[Path] = [
+        pkg_root / ".agents" / "plugins" / "rsi-harness" / "scripts",
+    ]
     if repo_root is not None:
         candidates.append(repo_root.resolve() / ".agents" / "plugins" / "rsi-harness" / "scripts")
-    candidates.append(Path(__file__).resolve().parents[1] / ".agents" / "plugins" / "rsi-harness" / "scripts")
     for cand in candidates:
         if cand.is_dir():
             s = str(cand)
             if s not in sys.path:
                 sys.path.insert(0, s)
             bench_dir = cand.parents[2] / "benchmarks"
-            if bench_dir.is_dir() and str(bench_dir) not in sys.path:
+            if (bench_dir / "run_bench.py").is_file() and str(bench_dir) not in sys.path:
+                os.environ.setdefault("RSI_BENCHMARKS_DIR", str(bench_dir))
                 sys.path.insert(0, str(bench_dir))
             return cand
     raise FileNotFoundError(

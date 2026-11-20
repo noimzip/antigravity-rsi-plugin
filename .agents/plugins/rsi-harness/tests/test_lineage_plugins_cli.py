@@ -581,6 +581,76 @@ class PrReporterAndCliTests(unittest.TestCase):
             mine_data = json.loads(_run_cli("mine", "--repo", str(work), "--json").stdout)
             self.assertIn("cluster_count", mine_data)
 
+    def test_copied_plugin_without_local_benchmarks_and_readonly_vendor_evolves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "target_app"
+            _init_git_repo(repo)
+
+            # Copy plugin bundle into target repo WITHOUT copying benchmarks/
+            dst_plugin = repo / ".agents" / "plugins" / "rsi-harness"
+            dst_plugin.mkdir(parents=True, exist_ok=True)
+            for fname in ("hooks.json", "plugin.json"):
+                shutil.copy2(PLUGIN_DIR / fname, dst_plugin / fname)
+            shutil.copytree(
+                PLUGIN_DIR / "scripts",
+                dst_plugin / "scripts",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+
+            # Simulate heavy node_modules & 0555 read-only vendor dir
+            nm = repo / "node_modules" / "pkg"
+            nm.mkdir(parents=True)
+            (nm / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+            vendor = repo / "vendor"
+            vendor.mkdir()
+            vbin = vendor / "tool"
+            vbin.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+            vbin.chmod(0o555)
+            vendor.chmod(0o555)
+
+            # Seed trace so trace-mined mode synthesizes source_dir task referencing target_app
+            tr = repo / ".rsi" / "traces" / "s1"
+            tr.mkdir(parents=True)
+            (tr / "summary.json").write_text(
+                json.dumps({"conversationId": "s1", "total_tokens": 25000, "errors": 1}),
+                encoding="utf-8",
+            )
+            (tr / "events.jsonl").write_text(
+                json.dumps({"toolName": "run_command", "error": "AssertionError: failed"}) + "\n",
+                encoding="utf-8",
+            )
+
+            try:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "rsi_harness",
+                        "evolve",
+                        "--repo",
+                        str(repo),
+                        "--mode",
+                        "trace-mined",
+                        "--runner",
+                        "mock",
+                        "--pr-dry-run",
+                        "--pr-base",
+                        "main",
+                    ],
+                    cwd=str(REPO_ROOT),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                data = json.loads(proc.stdout)
+                self.assertEqual(data["evolution_mode"], "trace-mined")
+                self.assertIn("baseline", data)
+                self.assertTrue(Path(data["pr_report_path"]).is_file())
+            finally:
+                vendor.chmod(0o755)
+                vbin.chmod(0o755)
+
 
 if __name__ == "__main__":
     unittest.main()
