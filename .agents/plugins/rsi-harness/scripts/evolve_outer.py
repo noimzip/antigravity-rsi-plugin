@@ -355,7 +355,7 @@ def validate_proposal_rrsi(
     max_diff_lines = int(annealed["max_diff_lines"])
     surface = resolve_mutable_surface(worktree, config)
 
-    status_out = _git(worktree, "status", "--porcelain").stdout.splitlines()
+    status_out = _git(worktree, "status", "--porcelain", "--untracked-files=all").stdout.splitlines()
     changed_files: list[str] = []
     for line in status_out:
         if len(line) >= 4:

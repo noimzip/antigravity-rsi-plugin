@@ -26,7 +26,11 @@ if str(REPO_ROOT / "benchmarks") not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from evolve_outer import compute_selection_diagnostics, run_evolution_cycle  # noqa: E402
+from evolve_outer import (  # noqa: E402
+    compute_selection_diagnostics,
+    run_evolution_cycle,
+    validate_proposal_rrsi,
+)
 from interfaces import (  # noqa: E402
     Critic,
     Evaluator,
@@ -650,6 +654,35 @@ class PrReporterAndCliTests(unittest.TestCase):
             finally:
                 vendor.chmod(0o755)
                 vbin.chmod(0o755)
+
+    def test_validate_proposal_rrsi_allows_new_untracked_skill_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init_git_repo(repo)
+            base_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+
+            # Simulate Proposer creating a brand-new skills/<name>/SKILL.md directory + editing AGENTS.md
+            skill_file = repo / "skills" / "execution-hygiene" / "SKILL.md"
+            skill_file.parent.mkdir(parents=True, exist_ok=True)
+            skill_file.write_text("# Execution Hygiene\n- Verify tests.\n", encoding="utf-8")
+            (repo / "AGENTS.md").write_text("# Repo Rules\n- Be careful.\n- Check bounds.\n", encoding="utf-8")
+
+            from common import load_rsi_config
+
+            ok, reasons, meta = validate_proposal_rrsi(
+                repo,
+                base_sha,
+                load_rsi_config(repo),
+                history=[],
+                benchmark_ids=[],
+            )
+            self.assertTrue(ok, reasons)
+            self.assertEqual(reasons, [])
+            self.assertIn("skills/execution-hygiene/SKILL.md", meta["changed_files"])
+            self.assertIn("AGENTS.md", meta["changed_files"])
+            self.assertNotIn("skills/", meta["changed_files"])
 
 
 if __name__ == "__main__":
