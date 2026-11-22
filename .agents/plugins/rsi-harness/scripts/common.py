@@ -58,6 +58,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_ood_regression": 0.05,
         "enforce_anti_goodhart": True,
         "max_rules_bytes": 24000,
+        "rules_budget_mode": "standard",
+        "max_skills_bytes": None,
         "annealing": {
             "enabled": True,
             "decay_rate": 0.85,

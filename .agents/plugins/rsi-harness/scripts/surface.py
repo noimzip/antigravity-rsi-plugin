@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -301,6 +302,59 @@ class MutableSurface:
         if total_bytes > self.total_max_bytes:
             violations.append(f"rules_budget_exceeded:{total_bytes}>{self.total_max_bytes}")
         return total_bytes, entry_totals, violations
+
+    def compute_role_bytes(self, repo_root: Path) -> dict[str, int]:
+        """Compute unique byte totals grouped by surface entry role (e.g. rules, skills)."""
+        root = repo_root.resolve()
+        files = self._walk_repo_rel_files(root)
+        by_role: dict[str, dict[str, int]] = {}
+        for entry in self.entries:
+            role_map = by_role.setdefault(entry.role, {})
+            for rel, full in files:
+                if self.matches_protected(rel):
+                    continue
+                if _matches_pattern(rel, entry.path):
+                    role_map[rel] = len(full.read_bytes()) if full.is_file() else 0
+        return {role: sum(sizes.values()) for role, sizes in by_role.items()}
+
+    def compute_git_ref_role_bytes(self, repo_root: Path, git_ref: str) -> dict[str, int]:
+        """Compute unique byte totals grouped by role at ``git_ref`` via git object inspection."""
+        if not git_ref:
+            return {}
+        tree_proc = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", git_ref],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tree_proc.returncode != 0:
+            return {}
+        rel_files = [ln.strip() for ln in tree_proc.stdout.splitlines() if ln.strip()]
+        size_cache: dict[str, int] = {}
+        by_role: dict[str, dict[str, int]] = {}
+        for entry in self.entries:
+            role_map = by_role.setdefault(entry.role, {})
+            for rel in rel_files:
+                if self.matches_protected(rel):
+                    continue
+                if _matches_pattern(rel, entry.path):
+                    if rel not in size_cache:
+                        sz_proc = subprocess.run(
+                            ["git", "cat-file", "-s", f"{git_ref}:{rel}"],
+                            cwd=str(repo_root),
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        if sz_proc.returncode != 0:
+                            continue
+                        try:
+                            size_cache[rel] = int(sz_proc.stdout.strip())
+                        except ValueError:
+                            continue
+                    role_map[rel] = size_cache[rel]
+        return {role: sum(sizes.values()) for role, sizes in by_role.items()}
 
 
 def resolve_mutable_surface(repo_root: Path, config: dict[str, Any]) -> MutableSurface:

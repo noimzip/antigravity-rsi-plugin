@@ -14,9 +14,50 @@ if str(SCRIPTS_DIR) not in sys.path:
 from common import load_jsonl  # noqa: E402
 from surface import resolve_mutable_surface  # noqa: E402
 
-_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
+_BULLET_RE = re.compile(r"^(\s*[-*]\s+)(.+?)\s*$")
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 _NON_ASCII_RUN_RE = re.compile(r"[^\x00-\x7f]+")
+
+_VERBOSE_REWRITES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bPlease make sure that you always\s+", re.IGNORECASE), "Always "),
+    (re.compile(r"\bPlease ensure that you always\s+", re.IGNORECASE), "Always "),
+    (re.compile(r"\bMake sure that you always\s+", re.IGNORECASE), "Always "),
+    (re.compile(r"\bMake sure to always\s+", re.IGNORECASE), "Always "),
+    (re.compile(r"\bBe sure to always\s+", re.IGNORECASE), "Always "),
+    (re.compile(r"\bIt is very important to note that\s+", re.IGNORECASE), ""),
+    (re.compile(r"\bIt is important to note that\s+", re.IGNORECASE), ""),
+    (re.compile(r"\bWhenever possible,\s*please\s+", re.IGNORECASE), ""),
+    (re.compile(r"\bIn order to\s+", re.IGNORECASE), "To "),
+    (re.compile(r"\bPlease remember to\s+", re.IGNORECASE), ""),
+    (re.compile(r"必ず忘れないように毎回"), "必ず"),
+    (re.compile(r"することを徹底して心がけること"), "すること"),
+    (re.compile(r"することを忘れないように注意してください"), "すること"),
+    (re.compile(r"するように心がけてください"), "すること"),
+    (re.compile(r"することが非常に重要です"), "すること"),
+    (re.compile(r"あらかじめ事前に"), "事前に"),
+)
+
+
+def _simplify_verbose_line(raw_line: str) -> str:
+    """Trim boilerplate filler phrases inside a markdown bullet without losing core meaning."""
+    m = _BULLET_RE.match(raw_line)
+    if not m:
+        return raw_line
+    prefix, body = m.group(1), m.group(2)
+    trimmed = body
+    for pat, repl in _VERBOSE_REWRITES:
+        trimmed = pat.sub(repl, trimmed)
+    if trimmed == body:
+        return raw_line
+    trimmed = re.sub(r"[ \t]{2,}", " ", trimmed).strip()
+    if not trimmed:
+        return raw_line
+    if trimmed[0].isascii() and trimmed[0].islower() and body[0].isupper():
+        trimmed = trimmed[0].upper() + trimmed[1:]
+    candidate = f"{prefix}{trimmed}"
+    if len(candidate.encode("utf-8")) < len(raw_line.encode("utf-8")):
+        return candidate
+    return raw_line
 
 
 def _semantic_tokens(text: str) -> set[str]:
@@ -102,12 +143,15 @@ def analyze_pruning_candidates(
     pruning_cfg = rrsi.get("pruning") if isinstance(rrsi.get("pruning"), dict) else {}
     jaccard_threshold = float(pruning_cfg.get("jaccard_threshold", 0.75))
     warn_ratio = float(pruning_cfg.get("warn_ratio", 0.75))
+    pointer_line_chars = int(pruning_cfg.get("pointer_line_chars", 220))
 
     surface = resolve_mutable_surface(repo, config)
     total_bytes, _, _ = surface.compute_surface_bytes(repo)
 
     seen_bullets: list[tuple[str, int, str, set[str]]] = []
     redundant_rules: list[dict[str, Any]] = []
+    verbose_rules: list[dict[str, Any]] = []
+    pointer_candidates: list[dict[str, Any]] = []
 
     for rule_file in surface.list_existing_files(repo, role="rules"):
         rel = rule_file.resolve().relative_to(repo).as_posix()
@@ -119,7 +163,7 @@ def analyze_pruning_candidates(
             m = _BULLET_RE.match(raw_line)
             if not m:
                 continue
-            body = m.group(1)
+            body = m.group(2)
             toks = _semantic_tokens(body)
             if not toks:
                 continue
@@ -140,6 +184,28 @@ def analyze_pruning_candidates(
                 )
             else:
                 seen_bullets.append((rel, line_no, body, toks))
+                simplified = _simplify_verbose_line(raw_line)
+                if simplified != raw_line:
+                    saved = len(raw_line.encode("utf-8")) - len(simplified.encode("utf-8"))
+                    if saved > 0:
+                        verbose_rules.append(
+                            {
+                                "file": rel,
+                                "line_number": line_no,
+                                "original": raw_line,
+                                "trimmed": simplified,
+                                "byte_saved": saved,
+                            }
+                        )
+                if len(body) > pointer_line_chars:
+                    pointer_candidates.append(
+                        {
+                            "file": rel,
+                            "line_number": line_no,
+                            "char_len": len(body),
+                            "preview": body[:100],
+                        }
+                    )
 
     # Dead skill detection against recent traces & history references.
     trace_corpus_parts: list[str] = [json_part for json_part in (
@@ -173,37 +239,80 @@ def analyze_pruning_candidates(
                     }
                 )
 
-    estimated_saved = sum(int(r["byte_len"]) for r in redundant_rules)
-    should_prune = bool(redundant_rules) or total_bytes > int(surface.total_max_bytes * warn_ratio)
+    redundant_saved = sum(int(r["byte_len"]) for r in redundant_rules)
+    verbose_saved = sum(int(v["byte_saved"]) for v in verbose_rules)
+    estimated_saved = redundant_saved + verbose_saved
+    should_prune = (
+        bool(redundant_rules)
+        or bool(verbose_rules)
+        or total_bytes > int(surface.total_max_bytes * warn_ratio)
+    )
     return {
         "total_surface_bytes": total_bytes,
         "max_surface_bytes": surface.total_max_bytes,
         "redundant_rules": redundant_rules,
+        "verbose_rules": verbose_rules,
+        "pointer_candidates": pointer_candidates,
         "dead_skills": dead_skills,
+        "verbose_bytes_saved": verbose_saved,
         "estimated_bytes_saved": estimated_saved,
         "should_prune": should_prune,
     }
 
 
-def apply_pruning_pass(worktree: Path, analysis: dict[str, Any]) -> list[str]:
-    """Remove redundant duplicate rule lines identified by ``analyze_pruning_candidates``."""
+def apply_pruning_pass(
+    worktree: Path,
+    analysis: dict[str, Any],
+    *,
+    trim_verbose: bool = True,
+) -> list[str]:
+    """Remove redundant duplicate rules and optionally simplify verbose phrasing."""
     redundant = analysis.get("redundant_rules") or []
-    by_file: dict[str, set[int]] = {}
+    verbose = (analysis.get("verbose_rules") or []) if trim_verbose else []
+
+    by_file_drop: dict[str, set[int]] = {}
     for item in redundant:
         rel = str(item.get("file") or "")
         ln = item.get("line_number")
         if rel and isinstance(ln, int):
-            by_file.setdefault(rel, set()).add(ln)
+            by_file_drop.setdefault(rel, set()).add(ln)
+
+    by_file_rewrite: dict[str, dict[int, str]] = {}
+    for item in verbose:
+        rel = str(item.get("file") or "")
+        ln = item.get("line_number")
+        trimmed = item.get("trimmed")
+        if rel and isinstance(ln, int) and isinstance(trimmed, str):
+            by_file_rewrite.setdefault(rel, {})[ln] = trimmed
 
     modified: list[str] = []
     wt = worktree.resolve()
-    for rel, drop_lines in sorted(by_file.items()):
+    all_files = sorted(set(by_file_drop) | set(by_file_rewrite))
+    for rel in all_files:
         target = (wt / rel).resolve(strict=False)
         if not target.is_file() or not target.is_relative_to(wt):
             continue
-        orig_lines = target.read_text(encoding="utf-8").splitlines()
-        kept = [line for idx, line in enumerate(orig_lines, start=1) if idx not in drop_lines]
-        if len(kept) < len(orig_lines):
-            target.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
+        orig_text = target.read_text(encoding="utf-8")
+        orig_lines = orig_text.splitlines()
+        drop_lines = by_file_drop.get(rel, set())
+        rewrites = by_file_rewrite.get(rel, {})
+
+        kept: list[str] = []
+        blank_run = 0
+        for idx, line in enumerate(orig_lines, start=1):
+            if idx in drop_lines:
+                continue
+            new_line = rewrites.get(idx, line)
+            if not new_line.strip():
+                blank_run += 1
+                if blank_run > 1:
+                    continue
+            else:
+                blank_run = 0
+            kept.append(new_line)
+
+        new_text = "\n".join(kept).rstrip() + ("\n" if kept else "")
+        if new_text != orig_text:
+            target.write_text(new_text, encoding="utf-8")
             modified.append(rel)
     return modified

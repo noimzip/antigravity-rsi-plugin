@@ -204,6 +204,10 @@ def _build_proposer_prompt(
     surface = resolve_mutable_surface(resolved_wt, cfg)
     max_files = int(rrsi.get("max_files", 2))
     max_diff_lines = int(rrsi.get("max_diff_lines", 80))
+    rules_budget_mode = str(rrsi.get("rules_budget_mode") or "standard").strip().lower()
+    role_bytes = surface.compute_role_bytes(resolved_wt)
+    rules_only_bytes = int(role_bytes.get("rules", 0))
+    skills_bytes = int(role_bytes.get("skills", 0))
 
     target_desc = (
         ", ".join(f"`{resolved_wt}/{e.path}` ({e.role})" for e in surface.entries)
@@ -212,15 +216,34 @@ def _build_proposer_prompt(
     protected_desc = ", ".join(f"`{p}`" for p in surface.protected_patterns) or "`hooks.json`, `scripts/`, `benchmarks/`"
     history_tail = json.dumps(history[-5:], ensure_ascii=False)
     trace_summary = json.dumps(trace_ctx, ensure_ascii=False)
+
+    ratchet_note = ""
+    if rules_budget_mode in {"ratchet", "progressive_disclosure"} or rules_only_bytes > surface.total_max_bytes:
+        ratchet_note = (
+            f"6. RATCHET / PROGRESSIVE DISCLOSURE ACTIVE (mode={rules_budget_mode}, "
+            f"current_rules_bytes={rules_only_bytes}, skills_bytes={skills_bytes}, "
+            f"surface_limit={surface.total_max_bytes}): "
+            "Do NOT increase total `role=rules` bytes (`AGENTS.md` / `CLAUDE.md`); "
+            "shrink or refactor rules into single-level `skills/<name>/SKILL.md` (or `.agents/skills/<name>/SKILL.md`) "
+            "using concise pointer entries.\n"
+        )
+
     return (
         f"You are a Meta-Harness Proposer working ONLY inside worktree `{resolved_wt}`.\n"
         f"Target mutable surface you may edit: {target_desc}.\n"
-        "Constraints (RRSI):\n"
+        "Constraints (RRSI) & Token-Efficiency Principles:\n"
         f"1. NEVER read/edit any file outside `{resolved_wt}` (do NOT touch parent directories).\n"
         f"2. Edit at most {max_files} files, <= {max_diff_lines} diff lines, and <= {surface.total_max_bytes} total surface bytes "
         "ONLY within the declared mutable surface.\n"
         f"3. Never touch protected paths: {protected_desc}.\n"
         "4. Do NOT hardcode task names or test filenames; propose generalizable engineering heuristics.\n"
+        "5. Progressive Disclosure & Token Tax Awareness:\n"
+        "   - Every byte in `AGENTS.md` / `CLAUDE.md` is injected into EVERY turn as an input token tax and increases Attention Dilution.\n"
+        "   - Avoid overly broad mandatory verification rules that force extra `run_command` retries/tokens on unrelated tasks.\n"
+        "   - Keep `AGENTS.md` concise (~<= 60 lines of universal invariants + index pointers) and offload situational playbooks into single-level `skills/<name>/SKILL.md` files (Pointer Pattern).\n"
+        "   - Prefer compressing, deduplicating, or extracting redundant prose over append-only additions.\n"
+        f"{ratchet_note}"
+        f"Current surface footprint: rules_bytes={rules_only_bytes}, skills_bytes={skills_bytes}.\n"
         f"Recent trace context: {trace_summary}\n"
         f"Recent evolution history (avoid failed hypotheses): {history_tail}\n"
         f"Inspect `{resolved_wt}/.rsi/traces/` and uncompressed history in `{resolved_wt}/.rsi/store/` "
@@ -434,16 +457,62 @@ def validate_proposal_rrsi(
                     reasons.append(f"critic_benchmark_leakage:expected_hash:{ah}")
 
     rules_bytes, surface_bytes, budget_violations = surface.compute_surface_bytes(worktree)
-    reasons.extend(budget_violations)
+    rrsi_cfg = config.get("rrsi") if isinstance(config.get("rrsi"), dict) else {}
+    rules_budget_mode = str(rrsi_cfg.get("rules_budget_mode") or "standard").strip().lower()
+    raw_max_skills = rrsi_cfg.get("max_skills_bytes")
+    max_skills_bytes = int(raw_max_skills) if raw_max_skills is not None else None
+
+    base_role_bytes = surface.compute_git_ref_role_bytes(worktree, base_sha)
+    cand_role_bytes = surface.compute_role_bytes(worktree)
+    base_rules_bytes = int(base_role_bytes.get("rules", 0))
+    cand_rules_bytes = int(cand_role_bytes.get("rules", 0))
+    rules_bytes_delta = cand_rules_bytes - base_rules_bytes
+    base_skills_bytes = int(base_role_bytes.get("skills", 0))
+    cand_skills_bytes = int(cand_role_bytes.get("skills", 0))
+    skills_bytes_delta = cand_skills_bytes - base_skills_bytes
+
+    rules_entry_paths = {e.path for e in surface.entries if e.role == "rules"}
+
+    if rules_budget_mode in {"ratchet", "progressive_disclosure"}:
+        if cand_rules_bytes > base_rules_bytes:
+            reasons.append(f"rules_ratchet_net_increase:{cand_rules_bytes}>{base_rules_bytes}")
+        elif base_rules_bytes > surface.total_max_bytes and cand_rules_bytes >= base_rules_bytes:
+            reasons.append(f"rules_ratchet_no_reduction:{cand_rules_bytes}>={base_rules_bytes}")
+
+        exempt_total = (
+            (base_rules_bytes > surface.total_max_bytes and cand_rules_bytes < base_rules_bytes)
+            or (rules_budget_mode == "progressive_disclosure" and cand_rules_bytes < base_rules_bytes and skills_bytes_delta > 0)
+        )
+        exempt_oversized_rules_entry = base_rules_bytes > surface.total_max_bytes and cand_rules_bytes < base_rules_bytes
+        for viol in budget_violations:
+            if viol.startswith("rules_budget_exceeded:") and exempt_total:
+                continue
+            if viol.startswith("surface_entry_budget_exceeded:") and exempt_oversized_rules_entry:
+                entry_path = viol.split(":", 2)[1]
+                if entry_path in rules_entry_paths:
+                    continue
+            reasons.append(viol)
+
+        if rules_budget_mode == "progressive_disclosure" and max_skills_bytes is not None and cand_skills_bytes > max_skills_bytes:
+            reasons.append(f"skills_budget_exceeded:{cand_skills_bytes}>{max_skills_bytes}")
+    else:
+        reasons.extend(budget_violations)
 
     meta = {
         "changed_files": changed_files,
         "diff_lines": diff_lines,
         "diff_hash": diff_hash,
         "rules_bytes": rules_bytes,
+        "base_rules_bytes": base_rules_bytes,
+        "rules_only_bytes": cand_rules_bytes,
+        "rules_bytes_delta": rules_bytes_delta,
+        "skills_bytes": cand_skills_bytes,
+        "skills_bytes_delta": skills_bytes_delta,
+        "rules_budget_mode": rules_budget_mode,
         "surface_bytes": surface_bytes,
         "effective_budget": annealed,
-        "pruning_recommended": rules_bytes > int(surface.total_max_bytes * 0.75),
+        "pruning_recommended": cand_rules_bytes > int(surface.total_max_bytes * 0.75)
+        or rules_bytes > int(surface.total_max_bytes * 0.75),
     }
     return len(reasons) == 0, reasons, meta
 

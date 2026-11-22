@@ -151,6 +151,23 @@ def generate_pr_report(
     if isinstance((candidate or {}).get("meta_reward"), dict):
         lines.extend(["", f"- **Meta-Reward Breakdown**: `{json.dumps(candidate['meta_reward'], ensure_ascii=False)}`"])
 
+    diff_summary_line = (
+        f"- **Diff Lines**: `{record.get('diff_lines', 0)}` | **Rules Bytes**: `{record.get('rules_bytes', 0)}` | **Diff Hash**: `{record.get('diff_hash') or '-'}`"
+    )
+    if "rules_only_bytes" in record and "base_rules_bytes" in record:
+        r_delta = int(record.get("rules_bytes_delta", 0))
+        s_delta = int(record.get("skills_bytes_delta", 0))
+        diff_summary_line += (
+            f"\n- **Progressive Disclosure Footprint**: `rules`: {record['base_rules_bytes']} -> "
+            f"{record['rules_only_bytes']} ({r_delta:+d} B)"
+            + (
+                f", `skills`: {record.get('skills_bytes', 0)} ({s_delta:+d} B)"
+                if "skills_bytes" in record
+                else ""
+            )
+            + (f", mode=`{record.get('rules_budget_mode')}`" if record.get("rules_budget_mode") else "")
+        )
+
     lines.extend(
         [
             "",
@@ -161,7 +178,7 @@ def generate_pr_report(
             "",
             "## RRSI Bounded Surface & Diff",
             f"- **Changed Files**: {', '.join(f'`{p}`' for p in (record.get('changed_files') or [])) or 'none'}",
-            f"- **Diff Lines**: `{record.get('diff_lines', 0)}` | **Rules Bytes**: `{record.get('rules_bytes', 0)}` | **Diff Hash**: `{record.get('diff_hash') or '-'}`",
+            diff_summary_line,
             f"- **TraceStore Snapshot**: `{record.get('store_dir') or '-'}` (gen={record.get('store_generation', '-')})",
         ]
     )
