@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -22,12 +23,16 @@ if str(REPO_ROOT / "benchmarks") not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from adapters.runtime import AgyAdapter  # noqa: E402
 from budget_and_pruning import analyze_pruning_candidates, apply_pruning_pass  # noqa: E402
-from common import load_rsi_config  # noqa: E402
+from common import compute_effective_token_cost, load_jsonl, load_rsi_config  # noqa: E402
 from evolve_outer import (  # noqa: E402
     _build_proposer_prompt,
+    compute_selection_diagnostics,
     evaluate_selection_gate,
+    merge_benchmark_reports,
     run_evolution_cycle,
+    should_expand_adaptive_trials,
     validate_proposal_rrsi,
 )
 from guard_harness import evaluate_tool_guard  # noqa: E402
@@ -537,6 +542,284 @@ mutable_surface:
             assertions = suite["tasks"][0]["verifier"]["behavior_assertions"]
             self.assertEqual(assertions["max_consecutive_errors"], 2)
             self.assertEqual(assertions["max_tool_calls"], 10)
+
+
+class M6AdaptiveTrialsAndCostTests(unittest.TestCase):
+    def _init_repo(self, repo: Path, adaptive_cfg: dict[str, object]) -> None:
+        repo.mkdir(parents=True, exist_ok=True)
+        (repo / ".gitignore").write_text(".rsi/\n__pycache__/\n", encoding="utf-8")
+        (repo / "AGENTS.md").write_text("# Rules\n- Be careful.\n", encoding="utf-8")
+        (repo / "rsi.config.json").write_text(
+            json.dumps(
+                {
+                    "rrsi": {
+                        "n_trials": 3,
+                        "max_files": 2,
+                        "min_token_reduction_ratio": 0.1,
+                        "use_effective_token_cost": True,
+                        "cost_weights": {
+                            "input_token_weight": 1.0,
+                            "cache_read_token_weight": 0.1,
+                            "output_token_weight": 4.0,
+                            "tool_call_weight": 50.0,
+                        },
+                        "adaptive_trials": adaptive_cfg,
+                    },
+                    "mutable_surface": [{"path": "AGENTS.md", "role": "rules"}],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "RSI"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "rsi@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    def test_runtime_result_enriched_from_traces_and_effective_cost_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "wt"
+            cwd.mkdir()
+            tr = cwd / ".rsi" / "traces" / "c1"
+            tr.mkdir(parents=True)
+            (tr / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "conversationId": "c1",
+                        "input_tokens": 1000,
+                        "cache_read_tokens": 2000,
+                        "output_tokens": 300,
+                        "total_tokens": 3300,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tr / "events.jsonl").write_text(
+                json.dumps({"event": "post_tool", "toolName": "read_file"}) + "\n"
+                + json.dumps({"event": "post_tool", "toolName": "edit_file"}) + "\n"
+                + json.dumps({"event": "stop"}) + "\n",
+                encoding="utf-8",
+            )
+
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_agy = bin_dir / "agy"
+            fake_agy.write_text(
+                "#!/usr/bin/env python3\nimport json\nprint(json.dumps({'usage': {'total_tokens': 3300}}))\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+            orig_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{orig_path}"
+            try:
+                res = AgyAdapter().run("hi", cwd, timeout_sec=10)
+            finally:
+                os.environ["PATH"] = orig_path
+
+            self.assertEqual(res.input_tokens, 1000)
+            self.assertEqual(res.cache_read_tokens, 2000)
+            self.assertEqual(res.output_tokens, 300)
+            self.assertEqual(res.tool_calls, 2)
+            self.assertEqual(res.steps, 3)
+
+            cfg = {
+                "rrsi": {
+                    "use_effective_token_cost": True,
+                    "min_token_reduction_ratio": 0.1,
+                    "cost_weights": {
+                        "input_token_weight": 1.0,
+                        "cache_read_token_weight": 0.1,
+                        "output_token_weight": 4.0,
+                        "tool_call_weight": 50.0,
+                    },
+                }
+            }
+            # Candidate has nearly identical raw total_tokens (4000 vs 4100 = -2.4%),
+            # but far lower output_tokens (100 vs 600) & tool_calls (2 vs 8) + higher cache_read.
+            base = {
+                "pass_rate": 1.0,
+                "total_tokens": 4100,
+                "input_tokens": 2500,
+                "cache_read_tokens": 1000,
+                "output_tokens": 600,
+                "tool_calls": 8,
+                "steps": 10,
+                "duration_sec": 1.0,
+            }
+            cand = {
+                "pass_rate": 1.0,
+                "total_tokens": 4000,
+                "input_tokens": 900,
+                "cache_read_tokens": 3000,
+                "output_tokens": 100,
+                "tool_calls": 2,
+                "steps": 4,
+                "duration_sec": 0.9,
+            }
+            self.assertGreater(compute_effective_token_cost(base, cfg), compute_effective_token_cost(cand, cfg))
+            diag = compute_selection_diagnostics(base, cand, cfg)
+            self.assertTrue(diag["accepted"], diag)
+            self.assertEqual(diag["token_breakdown"]["delta"]["tool_calls"], -6)
+            self.assertEqual(diag["token_breakdown"]["delta"]["output_tokens"], -500)
+
+    def test_adaptive_trials_early_reject_expand_accept_and_noisy_reject(self) -> None:
+        class _StubProposer:
+            def propose(self, context: object) -> str:
+                wt = context.worktree_dir  # type: ignore[attr-defined]
+                p = wt / "AGENTS.md"
+                p.write_text(p.read_text(encoding="utf-8") + "- Adapted rule.\n", encoding="utf-8")
+                return "stub_proposal"
+
+        class _SequenceEvaluator:
+            def __init__(self, base_series: list[dict[str, float]], cand_series: list[dict[str, float]]) -> None:
+                self.base_series = list(base_series)
+                self.cand_series = list(cand_series)
+                self.base_calls = 0
+                self.cand_calls = 0
+
+            def _make_trial(self, row: dict[str, float], idx: int) -> dict[str, object]:
+                return {
+                    "trial": idx,
+                    "total_tasks": 2,
+                    "passed_tasks": int(round(row["pass_rate"] * 2)),
+                    "pass_rate": row["pass_rate"],
+                    "total_tokens": int(row["total_tokens"]),
+                    "effective_token_cost": float(row.get("effective_token_cost", row["total_tokens"])),
+                    "input_tokens": int(row.get("input_tokens", row["total_tokens"] * 0.5)),
+                    "cache_read_tokens": int(row.get("cache_read_tokens", row["total_tokens"] * 0.3)),
+                    "output_tokens": int(row.get("output_tokens", row["total_tokens"] * 0.2)),
+                    "tool_calls": int(row.get("tool_calls", 4)),
+                    "steps": int(row.get("steps", 6)),
+                    "duration_sec": float(row.get("duration_sec", 0.5)),
+                    "anti_goodhart_passed": True,
+                    "tampered_tasks": [],
+                    "behavior_passed": True,
+                    "behavior_failed_tasks": [],
+                    "tasks": [],
+                }
+
+            def evaluate(self, worktree_dir: Path, **kwargs: object) -> dict[str, object]:
+                n_trials = int(kwargs.get("n_trials", 1))
+                is_cand = "Adapted rule." in (worktree_dir / "AGENTS.md").read_text(encoding="utf-8")
+                trials = []
+                for _ in range(n_trials):
+                    if is_cand:
+                        row = self.cand_series[self.cand_calls]
+                        self.cand_calls += 1
+                    else:
+                        row = self.base_series[self.base_calls]
+                        self.base_calls += 1
+                    trials.append(self._make_trial(row, len(trials) + 1))
+                return merge_benchmark_reports(
+                    [
+                        {
+                            "suite": "stub",
+                            "runner": "mock",
+                            "split": "all",
+                            "trials": trials,
+                        }
+                    ]
+                )
+
+        adaptive_cfg = {
+            "enabled": True,
+            "initial_trials": 1,
+            "max_trials": 3,
+            "early_reject_pass_rate_drop": 0.05,
+            "early_reject_token_overhead_ratio": 0.15,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "tasks.json"
+            shutil.copy2(REPO_ROOT / "benchmarks" / "tasks.json", manifest)
+
+            # 1. Immediate reject on 1st trial (pass_rate regressed -> no extra trials run)
+            repo_reject = root / "repo_reject"
+            self._init_repo(repo_reject, adaptive_cfg)
+            ev_reject = _SequenceEvaluator(
+                [{"pass_rate": 1.0, "total_tokens": 2000}] * 3,
+                [{"pass_rate": 0.5, "total_tokens": 1800}] * 3,
+            )
+            res_reject = run_evolution_cycle(
+                repo_reject,
+                manifest_path=manifest,
+                proposer=_StubProposer(),
+                evaluator=ev_reject,
+            )
+            self.assertFalse(res_reject["accepted"])
+            self.assertFalse(res_reject["adaptive_trials"]["expanded"])
+            self.assertEqual(ev_reject.base_calls, 1)
+            self.assertEqual(ev_reject.cand_calls, 1)
+
+            # 2. Borderline on trial 1 (-12% cost) -> expanded to 3 trials -> consistent -> accepted + PR table
+            repo_acc = root / "repo_acc"
+            self._init_repo(repo_acc, adaptive_cfg)
+            ev_acc = _SequenceEvaluator(
+                [
+                    {"pass_rate": 1.0, "total_tokens": 2000, "effective_token_cost": 2000.0, "tool_calls": 6},
+                    {"pass_rate": 1.0, "total_tokens": 2010, "effective_token_cost": 2010.0, "tool_calls": 6},
+                    {"pass_rate": 1.0, "total_tokens": 1990, "effective_token_cost": 1990.0, "tool_calls": 6},
+                ],
+                [
+                    {"pass_rate": 1.0, "total_tokens": 1700, "effective_token_cost": 1600.0, "tool_calls": 3},
+                    {"pass_rate": 1.0, "total_tokens": 1710, "effective_token_cost": 1610.0, "tool_calls": 3},
+                    {"pass_rate": 1.0, "total_tokens": 1690, "effective_token_cost": 1590.0, "tool_calls": 3},
+                ],
+            )
+            res_acc = run_evolution_cycle(
+                repo_acc,
+                manifest_path=manifest,
+                proposer=_StubProposer(),
+                evaluator=ev_acc,
+                pr_mode="dry-run",
+            )
+            self.assertTrue(res_acc["accepted"], res_acc)
+            self.assertTrue(res_acc["adaptive_trials"]["expanded"])
+            self.assertEqual(res_acc["n_trials"], 3)
+            self.assertEqual(ev_acc.base_calls, 3)
+            self.assertEqual(ev_acc.cand_calls, 3)
+            report_md = Path(res_acc["pr_report_path"]).read_text(encoding="utf-8")
+            self.assertIn("effective_token_cost", report_md)
+            self.assertIn("cache_read_tokens", report_md)
+            self.assertIn("tool_calls", report_md)
+            hist_rec = load_jsonl(repo_acc / ".rsi" / "evolution_history.jsonl")[-1]
+            self.assertIn("token_breakdown", hist_rec["selection_diagnostics"])
+
+            # 3. Promising on trial 1 (-15% cost) -> expanded to 3 trials -> high variance -> noisy reject
+            repo_noisy = root / "repo_noisy"
+            self._init_repo(repo_noisy, adaptive_cfg)
+            ev_noisy = _SequenceEvaluator(
+                [
+                    {"pass_rate": 1.0, "total_tokens": 2000, "effective_token_cost": 2000.0},
+                    {"pass_rate": 1.0, "total_tokens": 2400, "effective_token_cost": 2400.0},
+                    {"pass_rate": 1.0, "total_tokens": 1600, "effective_token_cost": 1600.0},
+                ],
+                [
+                    {"pass_rate": 1.0, "total_tokens": 1700, "effective_token_cost": 1700.0},
+                    {"pass_rate": 1.0, "total_tokens": 2200, "effective_token_cost": 2200.0},
+                    {"pass_rate": 1.0, "total_tokens": 1400, "effective_token_cost": 1400.0},
+                ],
+            )
+            res_noisy = run_evolution_cycle(
+                repo_noisy,
+                manifest_path=manifest,
+                proposer=_StubProposer(),
+                evaluator=ev_noisy,
+            )
+            self.assertFalse(res_noisy["accepted"])
+            self.assertTrue(res_noisy["adaptive_trials"]["expanded"])
+            self.assertTrue(any("noisy_variance_exceeds_gain" in r for r in res_noisy["reasons"]), res_noisy)
+
+            # Direct helper sanity check
+            ok_exp, _ = should_expand_adaptive_trials(
+                {"pass_rate": 1.0, "total_tokens": 1000, "duration_sec": 1.0},
+                {"pass_rate": 1.0, "total_tokens": 950, "duration_sec": 1.0},
+                {"rrsi": {"adaptive_trials": adaptive_cfg}},
+            )
+            self.assertTrue(ok_exp)
 
 
 if __name__ == "__main__":

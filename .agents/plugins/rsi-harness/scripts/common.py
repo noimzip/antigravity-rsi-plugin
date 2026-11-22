@@ -61,6 +61,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_rules_bytes": 24000,
         "rules_budget_mode": "standard",
         "max_skills_bytes": None,
+        "use_effective_token_cost": False,
+        "cost_weights": {
+            "input_token_weight": 1.0,
+            "cache_read_token_weight": 0.1,
+            "output_token_weight": 4.0,
+            "tool_call_weight": 0.0,
+        },
+        "adaptive_trials": {
+            "enabled": False,
+            "initial_trials": 1,
+            "max_trials": 3,
+            "early_reject_pass_rate_drop": 0.05,
+            "early_reject_token_overhead_ratio": 0.15,
+        },
         "annealing": {
             "enabled": True,
             "decay_rate": 0.85,
@@ -237,3 +251,28 @@ def summarize_transcript(transcript_path: str | Path | None) -> dict[str, Any]:
     summary["total_tokens"] = max(computed, explicit_total)
     summary["latency_ms"] = round(summary["latency_ms"], 3)
     return summary
+
+
+def compute_effective_token_cost(
+    metrics: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> float:
+    """Compute weighted effective token cost accounting for input, cache read, output, and tool calls."""
+    rrsi = (config or {}).get("rrsi") if isinstance((config or {}).get("rrsi"), dict) else {}
+    weights = rrsi.get("cost_weights") if isinstance(rrsi.get("cost_weights"), dict) else {}
+    w_in = float(weights.get("input_token_weight", 1.0))
+    w_cache = float(weights.get("cache_read_token_weight", 0.1))
+    w_out = float(weights.get("output_token_weight", 4.0))
+    w_tool = float(weights.get("tool_call_weight", 0.0))
+
+    inp = float(metrics.get("input_tokens") or 0.0)
+    cache = float(metrics.get("cache_read_tokens") or 0.0)
+    out = float(metrics.get("output_tokens") or 0.0)
+    total = float(metrics.get("total_tokens") or 0.0)
+    tools = float(metrics.get("tool_calls") or 0.0)
+
+    if inp + cache + out > 0:
+        cost = inp * w_in + cache * w_cache + out * w_out + tools * w_tool
+    else:
+        cost = total + tools * w_tool
+    return round(cost, 4)

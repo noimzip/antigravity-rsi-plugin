@@ -286,6 +286,7 @@ def _cmd_evolve(args: argparse.Namespace) -> int:
         seed=args.seed,
         pr_mode=pr_mode,
         pr_base=args.pr_base,
+        adaptive_trials=args.adaptive_trials,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -428,6 +429,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_evolve.add_argument("--pr-dry-run", action="store_true")
     p_evolve.add_argument("--create-pr", action="store_true")
     p_evolve.add_argument("--pr-base", default=None, help="Base branch for PR (auto-detected if omitted)")
+    p_evolve.add_argument(
+        "--adaptive-trials",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable adaptive multi-trial evaluation expansion",
+    )
     p_evolve.add_argument("--mock-bad-proposal", default=None, choices=["leak", "budget", "protected"])
     p_evolve.set_defaults(func=_cmd_evolve)
 

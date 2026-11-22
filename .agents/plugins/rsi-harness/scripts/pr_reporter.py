@@ -70,11 +70,43 @@ def _format_metric_row(name: str, baseline: dict[str, Any] | None, candidate: di
         c_num = float(c_val) if c_val is not None else None
     except (TypeError, ValueError):
         return f"| {name} | {b_val} | {c_val} | - |"
-    b_str = f"{b_num:.4f}" if key == "pass_rate" and b_num is not None else (f"{b_num:.3f}" if key == "duration_sec" and b_num is not None else (str(int(b_num)) if b_num is not None else "-"))
-    c_str = f"{c_num:.4f}" if key == "pass_rate" and c_num is not None else (f"{c_num:.3f}" if key == "duration_sec" and c_num is not None else (str(int(c_num)) if c_num is not None else "-"))
+    b_str = (
+        f"{b_num:.4f}"
+        if key == "pass_rate" and b_num is not None
+        else (
+            f"{b_num:.3f}"
+            if key == "duration_sec" and b_num is not None
+            else (
+                f"{b_num:.2f}"
+                if key == "effective_token_cost" and b_num is not None
+                else (str(int(b_num)) if b_num is not None else "-")
+            )
+        )
+    )
+    c_str = (
+        f"{c_num:.4f}"
+        if key == "pass_rate" and c_num is not None
+        else (
+            f"{c_num:.3f}"
+            if key == "duration_sec" and c_num is not None
+            else (
+                f"{c_num:.2f}"
+                if key == "effective_token_cost" and c_num is not None
+                else (str(int(c_num)) if c_num is not None else "-")
+            )
+        )
+    )
     if b_num is not None and c_num is not None:
         delta = c_num - b_num
-        d_str = f"{delta:+.4f}" if key == "pass_rate" else (f"{delta:+.3f}" if key == "duration_sec" else f"{delta:+.0f}")
+        d_str = (
+            f"{delta:+.4f}"
+            if key == "pass_rate"
+            else (
+                f"{delta:+.3f}"
+                if key == "duration_sec"
+                else (f"{delta:+.2f}" if key == "effective_token_cost" else f"{delta:+.0f}")
+            )
+        )
     else:
         d_str = "-"
     return f"| {name} | {b_str} | {c_str} | {d_str} |"
@@ -131,10 +163,24 @@ def generate_pr_report(
         "|---|---:|---:|---:|",
         _format_metric_row("pass_rate", baseline, candidate, "pass_rate"),
         _format_metric_row("total_tokens", baseline, candidate, "total_tokens"),
-        _format_metric_row("duration_sec", baseline, candidate, "duration_sec"),
-        "",
-        f"- **Anti-Goodhart Verifier Integrity**: baseline=`{baseline.get('anti_goodhart_passed', True)}`, candidate=`{(candidate or {}).get('anti_goodhart_passed', 'n/a')}`",
     ]
+    for extra_key in (
+        "effective_token_cost",
+        "input_tokens",
+        "cache_read_tokens",
+        "output_tokens",
+        "tool_calls",
+        "steps",
+    ):
+        if (baseline and baseline.get(extra_key) is not None) or (candidate and candidate.get(extra_key) is not None):
+            lines.append(_format_metric_row(extra_key, baseline, candidate, extra_key))
+    lines.extend(
+        [
+            _format_metric_row("duration_sec", baseline, candidate, "duration_sec"),
+            "",
+            f"- **Anti-Goodhart Verifier Integrity**: baseline=`{baseline.get('anti_goodhart_passed', True)}`, candidate=`{(candidate or {}).get('anti_goodhart_passed', 'n/a')}`",
+        ]
+    )
 
     if ood_base is not None or ood_cand is not None:
         lines.extend(

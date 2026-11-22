@@ -77,6 +77,8 @@ class RuntimeRunResult:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     total_tokens: int = 0
+    tool_calls: int = 0
+    steps: int = 0
     duration_sec: float = 0.0
     trace_paths: list[str] = field(default_factory=list)
     raw_output: str = ""
@@ -144,6 +146,69 @@ class AgentRuntimeAdapter(ABC):
             found.extend(sorted(traces_dir.glob(pattern)))
         return found
 
+    def _enrich_result_from_traces(self, cwd: Path, result: RuntimeRunResult) -> None:
+        """Populate missing token breakdown, tool calls, and steps from ``.rsi/traces/*``."""
+        traces_dir = cwd / ".rsi" / "traces"
+        if not traces_dir.is_dir():
+            return
+        tr_inp = 0
+        tr_cache = 0
+        tr_out = 0
+        tr_tot = 0
+        tr_tools = 0
+        tr_steps = 0
+
+        for conv_dir in sorted(traces_dir.iterdir()):
+            if not conv_dir.is_dir():
+                continue
+            summary: dict[str, Any] = {}
+            sum_file = conv_dir / "summary.json"
+            if sum_file.is_file():
+                try:
+                    loaded = json.loads(sum_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        summary = loaded
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+            tr_inp += _to_int(summary.get("input_tokens"))
+            tr_cache += _to_int(summary.get("cache_read_tokens"))
+            tr_out += _to_int(summary.get("output_tokens"))
+            tr_tot += _to_int(summary.get("total_tokens"))
+
+            ev_file = conv_dir / "events.jsonl"
+            ev_steps = 0
+            ev_tools = 0
+            if ev_file.is_file():
+                for raw_ln in ev_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    raw_ln = raw_ln.strip()
+                    if not raw_ln:
+                        continue
+                    try:
+                        ev = json.loads(raw_ln)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    ev_steps += 1
+                    if str(ev.get("event") or "").lower() == "post_tool" or ev.get("toolName"):
+                        ev_tools += 1
+
+            tr_steps += max(ev_steps, _to_int(summary.get("steps")))
+            tr_tools += max(ev_tools, _to_int(summary.get("tool_calls")))
+
+        if result.input_tokens == 0 and result.cache_read_tokens == 0 and result.output_tokens == 0:
+            if tr_inp or tr_cache or tr_out:
+                result.input_tokens = tr_inp
+                result.cache_read_tokens = tr_cache
+                result.output_tokens = tr_out
+        if result.total_tokens == 0 and tr_tot > 0:
+            result.total_tokens = tr_tot
+        if result.tool_calls == 0 and tr_tools > 0:
+            result.tool_calls = tr_tools
+        if result.steps == 0 and tr_steps > 0:
+            result.steps = tr_steps
+
     def run(
         self,
         prompt: str,
@@ -196,6 +261,7 @@ class AgentRuntimeAdapter(ABC):
 
         duration_sec = round(time.monotonic() - started, 4)
         result = self.parse_output(stdout, stderr, exit_code, duration_sec, cmd)
+        self._enrich_result_from_traces(cwd, result)
         discovered = [str(p) for p in self.resolve_trace_paths(cwd, result)]
         for p in discovered:
             if p not in result.trace_paths:
@@ -671,6 +737,7 @@ class PtyWrapperAdapter(AgentRuntimeAdapter):
             encoding="utf-8",
         )
         result.trace_paths = [str(transcript_log), str(summary_json)]
+        self._enrich_result_from_traces(cwd, result)
         return result
 
 

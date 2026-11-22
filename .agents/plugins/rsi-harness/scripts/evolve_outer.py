@@ -63,7 +63,7 @@ from budget_and_pruning import (  # noqa: E402
     apply_pruning_pass,
     compute_annealed_budget,
 )
-from common import append_jsonl, load_jsonl, load_rsi_config  # noqa: E402
+from common import append_jsonl, compute_effective_token_cost, load_jsonl, load_rsi_config  # noqa: E402
 from interfaces import (  # noqa: E402
     BenchmarkEvaluator,
     Critic,
@@ -77,10 +77,44 @@ from interfaces import (  # noqa: E402
 from lineage import LineageArchive  # noqa: E402
 from pr_reporter import create_review_pr, detect_default_branch  # noqa: E402
 try:
-    from run_bench import load_benchmark_suite  # noqa: E402
+    from run_bench import aggregate_trial_metrics, load_benchmark_suite  # noqa: E402
 except ImportError:
     def load_benchmark_suite(manifest_or_dir: Path) -> dict[str, Any]:
         return json.loads(manifest_or_dir.read_text(encoding="utf-8"))
+
+    def aggregate_trial_metrics(trials: list[dict[str, Any]]) -> dict[str, Any]:
+        import statistics as _stats
+
+        def _ser(vals: list[float]) -> dict[str, float]:
+            n = len(vals)
+            if n == 0:
+                return {"n": 0, "mean": 0.0, "std": 0.0, "se": 0.0, "median": 0.0, "iqr": 0.0, "min": 0.0, "max": 0.0, "ci95_half_width": 0.0}
+            mean = _stats.mean(vals)
+            std = _stats.stdev(vals) if n >= 2 else 0.0
+            se = std / math.sqrt(n)
+            return {
+                "n": n,
+                "mean": round(mean, 6),
+                "std": round(std, 6),
+                "se": round(se, 6),
+                "median": round(_stats.median(vals), 6),
+                "iqr": 0.0,
+                "min": round(min(vals), 6),
+                "max": round(max(vals), 6),
+                "ci95_half_width": round(1.96 * se, 6),
+            }
+
+        return {
+            "pass_rate": _ser([float(t.get("pass_rate", 0.0)) for t in trials]),
+            "total_tokens": _ser([float(t.get("total_tokens", 0)) for t in trials]),
+            "effective_token_cost": _ser([float(t.get("effective_token_cost", t.get("total_tokens", 0))) for t in trials]),
+            "input_tokens": _ser([float(t.get("input_tokens", 0)) for t in trials]),
+            "cache_read_tokens": _ser([float(t.get("cache_read_tokens", 0)) for t in trials]),
+            "output_tokens": _ser([float(t.get("output_tokens", 0)) for t in trials]),
+            "tool_calls": _ser([float(t.get("tool_calls", 0)) for t in trials]),
+            "steps": _ser([float(t.get("steps", 0)) for t in trials]),
+            "duration_sec": _ser([float(t.get("duration_sec", 0.0)) for t in trials]),
+        }
 from surface import resolve_mutable_surface  # noqa: E402
 from trace_store import TraceStore  # noqa: E402
 from weakness_miner import mine_weaknesses, synthesize_regression_suite  # noqa: E402
@@ -531,6 +565,21 @@ def _extract_metric(report: dict[str, Any], key: str) -> tuple[float, float, flo
     return float(report.get(key, 0.0)), 0.0, 0.0, n_default
 
 
+def _extract_effective_cost_metric(
+    report: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[float, float, float, int]:
+    """Extract ``(mean, std, se, n)`` for ``effective_token_cost`` with fallback computation."""
+    stats = report.get("stats")
+    if isinstance(stats, dict) and isinstance(stats.get("effective_token_cost"), dict):
+        return _extract_metric(report, "effective_token_cost")
+    if "effective_token_cost" in report and report["effective_token_cost"] is not None:
+        return _extract_metric(report, "effective_token_cost")
+    n_default = max(1, int(report.get("n_trials", 1)))
+    computed = compute_effective_token_cost(report, config)
+    return computed, 0.0, 0.0, n_default
+
+
 def compute_selection_diagnostics(
     baseline: dict[str, Any],
     candidate: dict[str, Any],
@@ -545,16 +594,27 @@ def compute_selection_diagnostics(
     max_lat_overhead = float(rrsi.get("max_latency_overhead_ratio", 0.25))
     noise_z = float(rrsi.get("noise_z", 1.96))
     eps = float(rrsi.get("pareto_tie_epsilon", 0.005))
+    use_eff_cost = bool(rrsi.get("use_effective_token_cost", False))
 
     b_rate, b_rate_std, b_rate_se, b_n = _extract_metric(baseline, "pass_rate")
     c_rate, c_rate_std, c_rate_se, c_n = _extract_metric(candidate, "pass_rate")
-    b_tok, b_tok_std, b_tok_se, _ = _extract_metric(baseline, "total_tokens")
-    c_tok, c_tok_std, c_tok_se, _ = _extract_metric(candidate, "total_tokens")
+    b_raw_tok, b_raw_tok_std, b_raw_tok_se, _ = _extract_metric(baseline, "total_tokens")
+    c_raw_tok, c_raw_tok_std, c_raw_tok_se, _ = _extract_metric(candidate, "total_tokens")
+    b_eff_cost, b_eff_std, b_eff_se, _ = _extract_effective_cost_metric(baseline, config)
+    c_eff_cost, c_eff_std, c_eff_se, _ = _extract_effective_cost_metric(candidate, config)
     b_lat, b_lat_std, b_lat_se, _ = _extract_metric(baseline, "duration_sec")
     c_lat, c_lat_std, c_lat_se, _ = _extract_metric(candidate, "duration_sec")
 
+    if use_eff_cost:
+        b_tok, b_tok_std, b_tok_se = b_eff_cost, b_eff_std, b_eff_se
+        c_tok, c_tok_std, c_tok_se = c_eff_cost, c_eff_std, c_eff_se
+    else:
+        b_tok, b_tok_std, b_tok_se = b_raw_tok, b_raw_tok_std, b_raw_tok_se
+        c_tok, c_tok_std, c_tok_se = c_raw_tok, c_raw_tok_std, c_raw_tok_se
+
     rate_gain = c_rate - b_rate
     tok_reduction = ((b_tok - c_tok) / b_tok) if b_tok > 0 else 0.0
+    eff_cost_reduction = ((b_eff_cost - c_eff_cost) / b_eff_cost) if b_eff_cost > 0 else 0.0
     lat_reduction = ((b_lat - c_lat) / b_lat) if b_lat > 0 else 0.0
 
     se_rate = math.hypot(b_rate_se, c_rate_se)
@@ -614,6 +674,11 @@ def compute_selection_diagnostics(
                 f"insufficient_gain:rate_delta={rate_gain:.3f},token_reduction={tok_reduction:.3f}"
             ]
 
+    breakdown_keys = ("input_tokens", "cache_read_tokens", "output_tokens", "tool_calls", "steps")
+    base_breakdown = {k: int(round(float(baseline.get(k) or 0))) for k in breakdown_keys}
+    cand_breakdown = {k: int(round(float(candidate.get(k) or 0))) for k in breakdown_keys}
+    delta_breakdown = {k: cand_breakdown[k] - base_breakdown[k] for k in breakdown_keys}
+
     return {
         "accepted": accepted,
         "reasons": reasons,
@@ -622,6 +687,18 @@ def compute_selection_diagnostics(
         "rate_gain": round(rate_gain, 6),
         "tok_reduction": round(tok_reduction, 6),
         "lat_reduction": round(lat_reduction, 6),
+        "use_effective_token_cost": use_eff_cost,
+        "effective_token_cost": {
+            "baseline": round(b_eff_cost, 4),
+            "candidate": round(c_eff_cost, 4),
+            "delta": round(c_eff_cost - b_eff_cost, 4),
+            "reduction": round(eff_cost_reduction, 6),
+        },
+        "token_breakdown": {
+            "baseline": base_breakdown,
+            "candidate": cand_breakdown,
+            "delta": delta_breakdown,
+        },
         "baseline_std": {"pass_rate": round(b_rate_std, 6), "total_tokens": round(b_tok_std, 6), "duration_sec": round(b_lat_std, 6)},
         "candidate_std": {"pass_rate": round(c_rate_std, 6), "total_tokens": round(c_tok_std, 6), "duration_sec": round(c_lat_std, 6)},
         "se_rate": round(se_rate, 6),
@@ -634,6 +711,134 @@ def compute_selection_diagnostics(
         "eff_min_tok_delta": round(eff_min_tok_delta, 6),
         "eff_min_lat_delta": round(eff_min_lat_delta, 6),
     }
+
+
+def should_expand_adaptive_trials(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[bool, str]:
+    """Decide whether initial-trial candidate merits expansion to ``max_trials``."""
+    rrsi = config.get("rrsi") if isinstance(config.get("rrsi"), dict) else {}
+    adaptive = rrsi.get("adaptive_trials") if isinstance(rrsi.get("adaptive_trials"), dict) else {}
+    early_drop = float(adaptive.get("early_reject_pass_rate_drop", rrsi.get("pareto_tie_epsilon", 0.005)))
+    early_overhead = float(
+        adaptive.get("early_reject_token_overhead_ratio", rrsi.get("max_token_overhead_ratio", 0.15))
+    )
+    eps = float(rrsi.get("pareto_tie_epsilon", 0.005))
+    use_eff = bool(rrsi.get("use_effective_token_cost", False))
+
+    if rrsi.get("enforce_anti_goodhart", True) and candidate.get("anti_goodhart_passed") is False:
+        return False, "early_reject_anti_goodhart"
+
+    b_rate = float(baseline.get("pass_rate", 0.0))
+    c_rate = float(candidate.get("pass_rate", 0.0))
+    if c_rate < b_rate - early_drop:
+        return False, f"early_reject_pass_rate_regressed:{c_rate:.3f}<{b_rate:.3f}"
+
+    b_cost = (
+        compute_effective_token_cost(baseline, config)
+        if use_eff
+        else float(baseline.get("total_tokens", 0.0))
+    )
+    c_cost = (
+        compute_effective_token_cost(candidate, config)
+        if use_eff
+        else float(candidate.get("total_tokens", 0.0))
+    )
+    if b_cost > 0 and c_cost > b_cost * (1.0 + early_overhead):
+        return False, f"early_reject_token_overhead_too_high:{int(round(c_cost))}>{int(b_cost * (1.0 + early_overhead))}"
+
+    b_lat = float(baseline.get("duration_sec", 0.0))
+    c_lat = float(candidate.get("duration_sec", 0.0))
+    if (
+        c_rate <= b_rate + eps
+        and c_rate <= b_rate
+        and (b_cost <= 0 or c_cost >= b_cost)
+        and (b_lat <= 0 or c_lat >= b_lat)
+    ):
+        return False, "early_reject_no_improvement_on_initial_trial"
+
+    return True, "expand_for_statistical_confirmation"
+
+
+def merge_benchmark_reports(
+    reports: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge multiple benchmark reports (each with 1+ trials) into one aggregated report."""
+    if not reports:
+        raise ValueError("Cannot merge empty report list")
+
+    all_trials: list[dict[str, Any]] = []
+    for rep in reports:
+        rep_trials = rep.get("trials")
+        if isinstance(rep_trials, list) and rep_trials:
+            for t in rep_trials:
+                trial_copy = dict(t)
+                trial_copy["trial"] = len(all_trials) + 1
+                all_trials.append(trial_copy)
+        else:
+            single = {
+                "trial": len(all_trials) + 1,
+                "total_tasks": int(rep.get("total_tasks", 0)),
+                "passed_tasks": int(rep.get("passed_tasks", 0)),
+                "pass_rate": float(rep.get("pass_rate", 0.0)),
+                "total_tokens": float(rep.get("total_tokens", 0)),
+                "effective_token_cost": float(
+                    rep.get("effective_token_cost", compute_effective_token_cost(rep, config))
+                ),
+                "input_tokens": float(rep.get("input_tokens", 0)),
+                "cache_read_tokens": float(rep.get("cache_read_tokens", 0)),
+                "output_tokens": float(rep.get("output_tokens", 0)),
+                "tool_calls": float(rep.get("tool_calls", 0)),
+                "steps": float(rep.get("steps", 0)),
+                "duration_sec": float(rep.get("duration_sec", 0.0)),
+                "anti_goodhart_passed": rep.get("anti_goodhart_passed", True),
+                "tampered_tasks": list(rep.get("tampered_tasks") or []),
+                "behavior_passed": rep.get("behavior_passed", True),
+                "behavior_failed_tasks": list(rep.get("behavior_failed_tasks") or []),
+                "tasks": list(rep.get("tasks") or []),
+            }
+            all_trials.append(single)
+
+    stats = aggregate_trial_metrics(all_trials)
+    first = reports[0]
+    last = reports[-1]
+    all_tampered = sorted({tid for t in all_trials for tid in (t.get("tampered_tasks") or [])})
+    all_beh_failed = sorted({tid for t in all_trials for tid in (t.get("behavior_failed_tasks") or [])})
+    ag_passed = len(all_tampered) == 0 and all(t.get("anti_goodhart_passed", True) is not False for t in all_trials)
+    beh_passed = len(all_beh_failed) == 0 and all(t.get("behavior_passed", True) is not False for t in all_trials)
+    mean_passed = sum(float(t.get("passed_tasks", 0)) for t in all_trials) / len(all_trials)
+
+    merged = dict(last)
+    merged.update(
+        {
+            "suite": first.get("suite", last.get("suite", "mini-bench")),
+            "runner": first.get("runner", last.get("runner", "mock")),
+            "split": first.get("split", last.get("split", "all")),
+            "n_trials": len(all_trials),
+            "total_tasks": int(last.get("total_tasks", first.get("total_tasks", 0))),
+            "passed_tasks": int(round(mean_passed)),
+            "pass_rate": round(stats["pass_rate"]["mean"], 4),
+            "total_tokens": int(round(stats["total_tokens"]["mean"])),
+            "effective_token_cost": round(stats["effective_token_cost"]["mean"], 4),
+            "input_tokens": int(round(stats["input_tokens"]["mean"])),
+            "cache_read_tokens": int(round(stats["cache_read_tokens"]["mean"])),
+            "output_tokens": int(round(stats["output_tokens"]["mean"])),
+            "tool_calls": int(round(stats["tool_calls"]["mean"])),
+            "steps": int(round(stats["steps"]["mean"])),
+            "duration_sec": round(stats["duration_sec"]["mean"], 3),
+            "anti_goodhart_passed": ag_passed,
+            "tampered_tasks": all_tampered,
+            "behavior_passed": beh_passed,
+            "behavior_failed_tasks": all_beh_failed,
+            "stats": stats,
+            "trials": all_trials,
+            "tasks": all_trials[-1].get("tasks", last.get("tasks", [])),
+        }
+    )
+    return merged
 
 
 def evaluate_selection_gate(
@@ -744,6 +949,7 @@ def run_evolution_cycle(
     critic: Critic | str | dict[str, Any] | None = None,
     pr_mode: str = "none",
     pr_base: str | None = None,
+    adaptive_trials: bool | None = None,
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
@@ -777,6 +983,20 @@ def run_evolution_cycle(
     }
     rrsi_cfg = config.get("rrsi", {})
     n_trials = max(1, int(rrsi_cfg.get("n_trials", 1)))
+    adaptive_cfg = rrsi_cfg.get("adaptive_trials") if isinstance(rrsi_cfg.get("adaptive_trials"), dict) else {}
+    adaptive_enabled = (
+        bool(adaptive_cfg.get("enabled", False))
+        if adaptive_trials is None
+        else bool(adaptive_trials)
+    )
+    if adaptive_enabled:
+        initial_trials = max(1, int(adaptive_cfg.get("initial_trials", 1)))
+        max_trials = max(initial_trials, int(adaptive_cfg.get("max_trials", max(n_trials, 3))))
+        eval_n_trials = initial_trials
+    else:
+        initial_trials = n_trials
+        max_trials = n_trials
+        eval_n_trials = n_trials
     max_ood_reg = float(rrsi_cfg.get("max_ood_regression", 0.05))
     history_path = repo / ".rsi" / "evolution_history.jsonl"
     history = load_jsonl(history_path)
@@ -864,7 +1084,7 @@ def run_evolution_cycle(
                 runner=runner,
                 config=config,
                 trace_export_dir=wt_traces_dir,
-                n_trials=n_trials,
+                n_trials=eval_n_trials,
                 sandbox=sandbox,
                 manifest_path=effective_manifest,
                 split="train",
@@ -876,7 +1096,7 @@ def run_evolution_cycle(
                 runner=runner,
                 config=config,
                 trace_export_dir=None,
-                n_trials=n_trials,
+                n_trials=eval_n_trials,
                 sandbox=sandbox,
                 manifest_path=effective_manifest,
                 split="holdout",
@@ -887,7 +1107,7 @@ def run_evolution_cycle(
                     runner=runner,
                     config=config,
                     trace_export_dir=None,
-                    n_trials=n_trials,
+                    n_trials=eval_n_trials,
                     sandbox=sandbox,
                     manifest_path=effective_manifest,
                     split="ood",
@@ -898,7 +1118,7 @@ def run_evolution_cycle(
                 runner=runner,
                 config=config,
                 trace_export_dir=wt_traces_dir,
-                n_trials=n_trials,
+                n_trials=eval_n_trials,
                 sandbox=sandbox,
                 manifest_path=effective_manifest,
             )
@@ -1002,12 +1222,69 @@ def run_evolution_cycle(
             runner=runner,
             config=config,
             trace_export_dir=cand_traces_dir,
-            n_trials=n_trials,
+            n_trials=eval_n_trials,
             sandbox=sandbox,
             manifest_path=effective_manifest,
             split=("holdout" if has_holdout else None),
         )
+        adaptive_expanded = False
+        adaptive_reason = "fixed_trials"
+        if adaptive_enabled and max_trials > eval_n_trials:
+            should_expand, adaptive_reason = should_expand_adaptive_trials(
+                baseline_report,
+                candidate_report,
+                config,
+            )
+            if should_expand:
+                adaptive_expanded = True
+                extra_n = max_trials - eval_n_trials
+                extra_cand = active_evaluator.evaluate(
+                    worktree_dir,
+                    runner=runner,
+                    config=config,
+                    trace_export_dir=cand_traces_dir,
+                    n_trials=extra_n,
+                    sandbox=sandbox,
+                    manifest_path=effective_manifest,
+                    split=("holdout" if has_holdout else None),
+                )
+                candidate_report = merge_benchmark_reports(
+                    [candidate_report, extra_cand],
+                    config=config,
+                )
+                base_exp_sb = get_sandbox_adapter(config)
+                base_exp_wt = base_exp_sb.prepare(repo, base_sha, f"{run_id}-bexp")
+                try:
+                    _seed_worktree_traces(repo, base_exp_wt)
+                    extra_base = active_evaluator.evaluate(
+                        base_exp_wt,
+                        runner=runner,
+                        config=config,
+                        trace_export_dir=None,
+                        n_trials=extra_n,
+                        sandbox=base_exp_sb,
+                        manifest_path=effective_manifest,
+                        split=("holdout" if has_holdout else None),
+                    )
+                    baseline_report = merge_benchmark_reports(
+                        [baseline_report, extra_base],
+                        config=config,
+                    )
+                finally:
+                    base_exp_sb.cleanup()
+
+        effective_n_trials = int(candidate_report.get("n_trials", eval_n_trials))
         sel_diag = compute_selection_diagnostics(baseline_report, candidate_report, config)
+        adaptive_info = {
+            "enabled": adaptive_enabled,
+            "initial_trials": initial_trials,
+            "max_trials": max_trials,
+            "expanded": adaptive_expanded,
+            "reason": adaptive_reason,
+            "baseline_trials": int(baseline_report.get("n_trials", eval_n_trials)),
+            "candidate_trials": effective_n_trials,
+        }
+        sel_diag["adaptive_trials"] = adaptive_info
         sel_ok = bool(sel_diag["accepted"])
         sel_reasons = list(sel_diag["reasons"])
 
@@ -1017,7 +1294,7 @@ def run_evolution_cycle(
                 runner=runner,
                 config=config,
                 trace_export_dir=None,
-                n_trials=n_trials,
+                n_trials=effective_n_trials,
                 sandbox=sandbox,
                 manifest_path=effective_manifest,
                 split="ood",
@@ -1111,7 +1388,8 @@ def run_evolution_cycle(
             "evolution_mode": evolution_mode,
             "mined_clusters": mined_clusters,
             "split_mode": split_mode,
-            "n_trials": n_trials,
+            "n_trials": effective_n_trials,
+            "adaptive_trials": adaptive_info,
             "parent_strategy": parent_strategy,
             "parent_node_id": parent_node.node_id,
             "lineage_node_id": lineage_node_id,
@@ -1195,6 +1473,12 @@ def main() -> None:
         default=None,
         help="Base branch for PR report/creation (auto-detected if omitted)",
     )
+    parser.add_argument(
+        "--adaptive-trials",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable adaptive multi-trial evaluation expansion",
+    )
     args = parser.parse_args()
 
     pr_mode = "create" if args.create_pr else ("dry-run" if args.pr_dry_run else "none")
@@ -1211,6 +1495,7 @@ def main() -> None:
         seed=args.seed,
         pr_mode=pr_mode,
         pr_base=args.pr_base,
+        adaptive_trials=args.adaptive_trials,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

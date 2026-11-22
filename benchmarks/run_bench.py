@@ -26,7 +26,7 @@ if _SCRIPTS_DIR.is_dir() and str(_SCRIPTS_DIR) not in sys.path:
 
 from adapters.runtime import AgyAdapter, get_runtime_adapter, list_runtime_adapters  # noqa: E402
 from adapters.sandbox import get_sandbox_adapter  # noqa: E402
-from common import load_rsi_config  # noqa: E402
+from common import compute_effective_token_cost, load_rsi_config  # noqa: E402
 from surface import resolve_mutable_surface  # noqa: E402
 
 
@@ -381,6 +381,29 @@ def _run_agy_task(
     return res.total_tokens, res.raw_output[:500]
 
 
+def _run_adapter_task_detailed(
+    runner: str,
+    prompt: str,
+    task_dir: Path,
+    *,
+    runtime_config: dict[str, Any] | None = None,
+    timeout_sec: int = 120,
+    eval_mode: bool = False,
+) -> dict[str, Any]:
+    eff_timeout = int((runtime_config or {}).get("timeout_sec", timeout_sec))
+    adapter = AgyAdapter(runtime_config) if (runner == "agy" and not runtime_config) else get_runtime_adapter(runner, runtime_config)
+    res = adapter.run(prompt, task_dir, timeout_sec=eff_timeout, eval_mode=eval_mode)
+    return {
+        "total_tokens": res.total_tokens,
+        "input_tokens": res.input_tokens,
+        "cache_read_tokens": res.cache_read_tokens,
+        "output_tokens": res.output_tokens,
+        "tool_calls": res.tool_calls,
+        "steps": res.steps,
+        "note": (res.raw_output or res.stderr)[:500],
+    }
+
+
 def _run_adapter_task(
     runner: str,
     prompt: str,
@@ -390,12 +413,15 @@ def _run_adapter_task(
     timeout_sec: int = 120,
     eval_mode: bool = False,
 ) -> tuple[int, str]:
-    eff_timeout = int((runtime_config or {}).get("timeout_sec", timeout_sec))
-    if runner == "agy" and not runtime_config:
-        return _run_agy_task(prompt, task_dir, timeout_sec=eff_timeout, eval_mode=eval_mode)
-    adapter = get_runtime_adapter(runner, runtime_config)
-    res = adapter.run(prompt, task_dir, timeout_sec=eff_timeout, eval_mode=eval_mode)
-    return res.total_tokens, (res.raw_output or res.stderr)[:500]
+    details = _run_adapter_task_detailed(
+        runner,
+        prompt,
+        task_dir,
+        runtime_config=runtime_config,
+        timeout_sec=timeout_sec,
+        eval_mode=eval_mode,
+    )
+    return int(details["total_tokens"]), str(details["note"])
 
 
 def summarize_series(values: list[float]) -> dict[str, float]:
@@ -441,6 +467,14 @@ def aggregate_trial_metrics(trials: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "pass_rate": summarize_series([float(t.get("pass_rate", 0.0)) for t in trials]),
         "total_tokens": summarize_series([float(t.get("total_tokens", 0)) for t in trials]),
+        "effective_token_cost": summarize_series(
+            [float(t.get("effective_token_cost", t.get("total_tokens", 0))) for t in trials]
+        ),
+        "input_tokens": summarize_series([float(t.get("input_tokens", 0)) for t in trials]),
+        "cache_read_tokens": summarize_series([float(t.get("cache_read_tokens", 0)) for t in trials]),
+        "output_tokens": summarize_series([float(t.get("output_tokens", 0)) for t in trials]),
+        "tool_calls": summarize_series([float(t.get("tool_calls", 0)) for t in trials]),
+        "steps": summarize_series([float(t.get("steps", 0)) for t in trials]),
         "duration_sec": summarize_series([float(t.get("duration_sec", 0.0)) for t in trials]),
     }
 
@@ -818,10 +852,18 @@ def _run_single_trial(
     runtime_config: dict[str, Any] | None = None,
     enforce_anti_goodhart: bool = True,
     lock_harness_during_eval: bool = True,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    cfg = config if config is not None else load_rsi_config(repo_root)
     results: list[dict[str, Any]] = []
     passed_count = 0
     total_tokens = 0
+    total_input_tokens = 0
+    total_cache_read_tokens = 0
+    total_output_tokens = 0
+    total_tool_calls = 0
+    total_steps = 0
+    total_effective_cost = 0.0
     tampered_tasks: list[str] = []
     behavior_failed_tasks: list[str] = []
     started = time.monotonic()
@@ -853,6 +895,7 @@ def _run_single_trial(
             behavior_ok = True
             behavior_violations: list[str] = []
             trace_metrics: dict[str, Any] = {}
+            adapter_details: dict[str, Any] = {}
             try:
                 if ro_enabled and verifier_files:
                     _set_readonly(verifier_files, True)
@@ -861,14 +904,24 @@ def _run_single_trial(
 
                 if runner == "mock":
                     tokens, note = _apply_mock_solution(task_id, task_dir, rules_text)
+                    adapter_details = {
+                        "total_tokens": tokens,
+                        "input_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "output_tokens": 0,
+                        "tool_calls": 0,
+                        "steps": 0,
+                    }
                 else:
-                    tokens, note = _run_adapter_task(
+                    adapter_details = _run_adapter_task_detailed(
                         runner,
                         task.get("prompt", ""),
                         task_dir,
                         runtime_config=runtime_config,
                         eval_mode=lock_harness,
                     )
+                    tokens = int(adapter_details["total_tokens"])
+                    note = str(adapter_details["note"])
 
                 if enforce_anti_goodhart and pre_hashes:
                     tamper_violations.extend(_verify_integrity(task_dir, pre_hashes))
@@ -904,15 +957,55 @@ def _run_single_trial(
                 if harness_files:
                     _set_readonly(harness_files, False)
 
+            has_adapter_breakdown = (
+                int(adapter_details.get("input_tokens") or 0)
+                + int(adapter_details.get("cache_read_tokens") or 0)
+                + int(adapter_details.get("output_tokens") or 0)
+            ) > 0
+            task_inp = int(
+                adapter_details.get("input_tokens", 0)
+                if has_adapter_breakdown
+                else trace_metrics.get("input_tokens", 0)
+            )
+            task_cache = int(
+                adapter_details.get("cache_read_tokens", 0)
+                if has_adapter_breakdown
+                else trace_metrics.get("cache_read_tokens", 0)
+            )
+            task_out = int(
+                adapter_details.get("output_tokens", 0)
+                if has_adapter_breakdown
+                else trace_metrics.get("output_tokens", 0)
+            )
+            eff_tokens = tokens if tokens > 0 else int(trace_metrics.get("total_tokens") or 0)
+            task_tools = max(int(adapter_details.get("tool_calls") or 0), int(trace_metrics.get("tool_calls") or 0))
+            task_steps = max(int(adapter_details.get("steps") or 0), int(trace_metrics.get("steps") or 0))
+            task_eff_cost = compute_effective_token_cost(
+                {
+                    "input_tokens": task_inp,
+                    "cache_read_tokens": task_cache,
+                    "output_tokens": task_out,
+                    "total_tokens": eff_tokens,
+                    "tool_calls": task_tools,
+                },
+                cfg,
+            )
+
             if passed:
                 passed_count += 1
-            total_tokens += tokens
+            total_tokens += eff_tokens
+            total_input_tokens += task_inp
+            total_cache_read_tokens += task_cache
+            total_output_tokens += task_out
+            total_tool_calls += task_tools
+            total_steps += task_steps
+            total_effective_cost += task_eff_cost
 
             _export_task_traces(
                 task_dir,
                 task_id,
                 runner,
-                tokens,
+                eff_tokens,
                 passed,
                 trace_export_dir,
                 trial_idx=trial_idx,
@@ -929,7 +1022,13 @@ def _run_single_trial(
                     "behavior_passed": behavior_ok,
                     "behavior_violations": behavior_violations,
                     "trace_metrics": trace_metrics,
-                    "tokens": tokens,
+                    "tokens": eff_tokens,
+                    "input_tokens": task_inp,
+                    "cache_read_tokens": task_cache,
+                    "output_tokens": task_out,
+                    "tool_calls": task_tools,
+                    "steps": task_steps,
+                    "effective_token_cost": task_eff_cost,
                     "note": note,
                     "grader_tail": grader_tail,
                 }
@@ -942,6 +1041,12 @@ def _run_single_trial(
         "passed_tasks": passed_count,
         "pass_rate": round(passed_count / total, 4) if total else 0.0,
         "total_tokens": total_tokens,
+        "effective_token_cost": round(total_effective_cost, 4),
+        "input_tokens": total_input_tokens,
+        "cache_read_tokens": total_cache_read_tokens,
+        "output_tokens": total_output_tokens,
+        "tool_calls": total_tool_calls,
+        "steps": total_steps,
         "duration_sec": round(time.monotonic() - started, 3),
         "anti_goodhart_passed": len(tampered_tasks) == 0,
         "tampered_tasks": sorted(set(tampered_tasks)),
@@ -990,6 +1095,7 @@ def run_benchmark(
                 runtime_config=runtime_config,
                 enforce_anti_goodhart=enforce_ag,
                 lock_harness_during_eval=lock_harness,
+                config=cfg,
             )
         )
 
@@ -1007,6 +1113,12 @@ def run_benchmark(
         "passed_tasks": int(round(mean_passed)),
         "pass_rate": round(stats["pass_rate"]["mean"], 4),
         "total_tokens": int(round(stats["total_tokens"]["mean"])),
+        "effective_token_cost": round(stats["effective_token_cost"]["mean"], 4),
+        "input_tokens": int(round(stats["input_tokens"]["mean"])),
+        "cache_read_tokens": int(round(stats["cache_read_tokens"]["mean"])),
+        "output_tokens": int(round(stats["output_tokens"]["mean"])),
+        "tool_calls": int(round(stats["tool_calls"]["mean"])),
+        "steps": int(round(stats["steps"]["mean"])),
         "duration_sec": round(stats["duration_sec"]["mean"], 3),
         "anti_goodhart_passed": len(all_tampered) == 0,
         "tampered_tasks": all_tampered,
