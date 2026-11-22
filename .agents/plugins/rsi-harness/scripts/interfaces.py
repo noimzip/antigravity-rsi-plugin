@@ -94,6 +94,7 @@ class DefaultProposer:
                 context.trace_context,
                 context.history,
                 config=context.config,
+                metadata=context.metadata,
             )
         return evolve_outer._runtime_propose(
             context.runner,
@@ -101,6 +102,7 @@ class DefaultProposer:
             context.trace_context,
             context.history,
             config=context.config,
+            metadata=context.metadata,
         )
 
 
@@ -121,6 +123,7 @@ class BenchmarkEvaluator:
     ) -> dict[str, Any]:
         import evolve_outer
 
+        rrsi = (config or {}).get("rrsi") if isinstance((config or {}).get("rrsi"), dict) else {}
         return evolve_outer._run_bench_in_repo(
             worktree_dir,
             runner=runner,
@@ -129,6 +132,9 @@ class BenchmarkEvaluator:
             sandbox=sandbox,
             manifest_path=manifest_path,
             split=split,
+            max_tasks=rrsi.get("max_tasks"),
+            max_tokens_budget=rrsi.get("max_cycle_tokens"),
+            max_duration_sec=rrsi.get("max_cycle_timeout_sec"),
         )
 
 

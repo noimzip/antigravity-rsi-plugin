@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -227,11 +228,165 @@ def _seed_worktree_traces(repo: Path, worktree: Path) -> None:
     TraceStore(repo).mount_readonly_into_worktree(worktree)
 
 
+def build_task_diff_reflection(
+    baseline_report: dict[str, Any] | None,
+    candidate_report: dict[str, Any] | None,
+    *,
+    changed_files: list[str] | None = None,
+    proposer_note: str = "",
+) -> dict[str, Any]:
+    """Build GEPA-style per-task attribution diff highlighting improvements and trade-offs."""
+    base_tasks = {
+        str(t["id"]): t
+        for t in ((baseline_report or {}).get("tasks") or [])
+        if isinstance(t, dict) and t.get("id")
+    }
+    cand_tasks = {
+        str(t["id"]): t
+        for t in ((candidate_report or {}).get("tasks") or [])
+        if isinstance(t, dict) and t.get("id")
+    }
+    ordered_ids = list(dict.fromkeys([*base_tasks.keys(), *cand_tasks.keys()]))
+    per_task: list[dict[str, Any]] = []
+    improved_tasks: list[str] = []
+    regressed_tasks: list[str] = []
+
+    for tid in ordered_ids:
+        b = base_tasks.get(tid) or {}
+        c = cand_tasks.get(tid) or {}
+        b_pass = bool(b.get("passed")) if b else None
+        c_pass = bool(c.get("passed")) if c else None
+        b_tok = int(b.get("tokens") or 0)
+        c_tok = int(c.get("tokens") or 0)
+        tok_delta = c_tok - b_tok
+        tok_pct = round((tok_delta / b_tok) * 100.0, 2) if b_tok > 0 else 0.0
+
+        b_tm = b.get("trace_metrics") if isinstance(b.get("trace_metrics"), dict) else {}
+        c_tm = c.get("trace_metrics") if isinstance(c.get("trace_metrics"), dict) else {}
+        b_tools = int(b.get("tool_calls", b_tm.get("tool_calls", 0)) or 0)
+        c_tools = int(c.get("tool_calls", c_tm.get("tool_calls", 0)) or 0)
+        b_steps = int(b.get("steps", b_tm.get("steps", 0)) or 0)
+        c_steps = int(c.get("steps", c_tm.get("steps", 0)) or 0)
+        b_errs = int(b_tm.get("errors", 0) or 0)
+        c_errs = int(c_tm.get("errors", 0) or 0)
+
+        if b_pass is False and c_pass is True:
+            direction = "pass_improved"
+            improved_tasks.append(tid)
+        elif b_pass is True and c_pass is False:
+            direction = "pass_regressed"
+            regressed_tasks.append(tid)
+        elif tok_delta < 0:
+            direction = "tokens_improved"
+            improved_tasks.append(tid)
+        elif tok_delta > 0:
+            direction = "tokens_regressed"
+            regressed_tasks.append(tid)
+        else:
+            direction = "unchanged"
+
+        per_task.append(
+            {
+                "id": tid,
+                "pass_before": b_pass,
+                "pass_after": c_pass,
+                "baseline_tokens": b_tok,
+                "candidate_tokens": c_tok,
+                "tokens_delta": tok_delta,
+                "tokens_delta_pct": tok_pct,
+                "tool_calls_delta": c_tools - b_tools,
+                "steps_delta": c_steps - b_steps,
+                "errors_delta": c_errs - b_errs,
+                "direction": direction,
+            }
+        )
+
+    return {
+        "per_task": per_task,
+        "improved_tasks": improved_tasks,
+        "regressed_tasks": regressed_tasks,
+        "tradeoff_detected": bool(improved_tasks and regressed_tasks),
+        "changed_files": list(changed_files or []),
+        "proposer_note": proposer_note,
+    }
+
+
+def _build_history_reflection(history: list[dict[str, Any]], *, limit: int = 3) -> list[dict[str, Any]]:
+    reflections: list[dict[str, Any]] = []
+    for item in history[-limit:]:
+        if not isinstance(item, dict):
+            continue
+        attr = item.get("task_attribution_summary")
+        if not isinstance(attr, dict):
+            base = item.get("baseline")
+            cand = item.get("candidate")
+            if isinstance(base, dict) and isinstance(cand, dict) and (base.get("tasks") or cand.get("tasks")):
+                attr = build_task_diff_reflection(
+                    base,
+                    cand,
+                    changed_files=list(item.get("changed_files") or []),
+                    proposer_note=str(item.get("proposer_note") or ""),
+                )
+        if isinstance(attr, dict) and attr.get("per_task"):
+            reflections.append(
+                {
+                    "run_id": item.get("run_id"),
+                    "accepted": item.get("accepted"),
+                    **attr,
+                }
+            )
+    return reflections
+
+
+def _build_crossover_context(
+    repo: Path,
+    primary: Any,
+    secondary: Any,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    surface = resolve_mutable_surface(repo, config)
+    primary_rel = "AGENTS.md"
+    try:
+        primary_rel = surface.primary_rules_path(repo).resolve().relative_to(repo.resolve()).as_posix()
+    except Exception:
+        pass
+
+    def _summarize_parent(node: Any) -> dict[str, Any]:
+        sha = str(getattr(node, "commit_sha", "") or "")
+        diff_excerpt = ""
+        rules_excerpt = ""
+        if sha:
+            p_diff = _git(repo, "show", "--stat", "--patch", sha, "--", *getattr(node, "changed_files", []), check=False)
+            if p_diff.returncode == 0:
+                diff_excerpt = p_diff.stdout.strip()[:1400]
+            p_rules = _git(repo, "show", f"{sha}:{primary_rel}", check=False)
+            if p_rules.returncode == 0:
+                rules_excerpt = p_rules.stdout.strip()[:1400]
+        return {
+            "node_id": getattr(node, "node_id", ""),
+            "branch": getattr(node, "branch", ""),
+            "commit_sha": sha,
+            "pass_rate": float(getattr(node, "pass_rate", 0.0)),
+            "total_tokens": float(getattr(node, "total_tokens", 0.0)),
+            "latency_ms": float(getattr(node, "latency_ms", 0.0)),
+            "changed_files": list(getattr(node, "changed_files", []) or []),
+            "proposer_note": str((getattr(node, "metadata", None) or {}).get("proposer_note") or ""),
+            "diff_excerpt": diff_excerpt,
+            "rules_excerpt": rules_excerpt,
+        }
+
+    return {
+        "primary": _summarize_parent(primary),
+        "secondary": _summarize_parent(secondary),
+    }
+
+
 def _build_proposer_prompt(
     resolved_wt: Path,
     trace_ctx: dict[str, Any],
     history: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     cfg = config or load_rsi_config(resolved_wt)
     rrsi = cfg.get("rrsi") if isinstance(cfg.get("rrsi"), dict) else {}
@@ -262,6 +417,26 @@ def _build_proposer_prompt(
             "using concise pointer entries.\n"
         )
 
+    meta = metadata or {}
+    reflection_block = ""
+    hist_refl = meta.get("history_reflection") or _build_history_reflection(history)
+    if hist_refl:
+        reflection_block = (
+            "\n## GEPA Task Attribution Reflection (recent per-task deltas & trade-offs)\n"
+            + json.dumps(hist_refl, ensure_ascii=False)
+            + "\nDiagnose which specific rule lines helped vs regressed individual tasks before proposing edits.\n"
+        )
+
+    crossover_block = ""
+    crossover_info = meta.get("crossover_parents")
+    if isinstance(crossover_info, dict) and crossover_info.get("primary") and crossover_info.get("secondary"):
+        crossover_block = (
+            "\n## Pareto Crossover Synthesis\n"
+            "Synthesize the complementary strengths of these two non-dominated Pareto parents while avoiding their task regressions:\n"
+            + json.dumps(crossover_info, ensure_ascii=False)
+            + "\n"
+        )
+
     return (
         f"You are a Meta-Harness Proposer working ONLY inside worktree `{resolved_wt}`.\n"
         f"Target mutable surface you may edit: {target_desc}.\n"
@@ -277,6 +452,8 @@ def _build_proposer_prompt(
         "   - Keep `AGENTS.md` concise (~<= 60 lines of universal invariants + index pointers) and offload situational playbooks into single-level `skills/<name>/SKILL.md` files (Pointer Pattern).\n"
         "   - Prefer compressing, deduplicating, or extracting redundant prose over append-only additions.\n"
         f"{ratchet_note}"
+        f"{reflection_block}"
+        f"{crossover_block}"
         f"Current surface footprint: rules_bytes={rules_only_bytes}, skills_bytes={skills_bytes}.\n"
         f"Recent trace context: {trace_summary}\n"
         f"Recent evolution history (avoid failed hypotheses): {history_tail}\n"
@@ -292,10 +469,17 @@ def _runtime_propose(
     trace_ctx: dict[str, Any],
     history: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Invoke configured runtime adapter as Meta-Harness Proposer inside ``worktree``."""
     resolved_wt = worktree.resolve()
-    prompt = _build_proposer_prompt(resolved_wt, trace_ctx, history, config=config)
+    prompt = _build_proposer_prompt(
+        resolved_wt,
+        trace_ctx,
+        history,
+        config=config,
+        metadata=metadata,
+    )
     runtime_cfg = (config or {}).get("runtime") if isinstance((config or {}).get("runtime"), dict) else {}
     adapter = get_runtime_adapter(runner, runtime_cfg)
     timeout_sec = int(runtime_cfg.get("proposer_timeout_sec", 180))
@@ -314,9 +498,10 @@ def _agy_propose(
     trace_ctx: dict[str, Any],
     history: list[dict[str, Any]],
     config: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str:
     """Invoke Antigravity CLI as Meta-Harness Proposer inside ``worktree``."""
-    return _runtime_propose("agy", worktree, trace_ctx, history, config=config)
+    return _runtime_propose("agy", worktree, trace_ctx, history, config=config, metadata=metadata)
 
 
 _TEST_DEF_RE = re.compile(r"^\s*def\s+(test_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
@@ -885,6 +1070,9 @@ def _run_bench_in_repo(
     sandbox: SandboxAdapter | None = None,
     manifest_path: Path | None = None,
     split: str | None = None,
+    max_tasks: int | None = None,
+    max_tokens_budget: int | None = None,
+    max_duration_sec: float | None = None,
 ) -> dict[str, Any]:
     local_bench = repo_path / "benchmarks" / "run_bench.py"
     bench_script = "benchmarks/run_bench.py" if local_bench.is_file() else str(BENCHMARKS_DIR / "run_bench.py")
@@ -906,6 +1094,12 @@ def _run_bench_in_repo(
         cmd.extend(["--manifest", manifest_arg])
     if split is not None:
         cmd.extend(["--split", split])
+    if max_tasks is not None:
+        cmd.extend(["--max-tasks", str(int(max_tasks))])
+    if max_tokens_budget is not None:
+        cmd.extend(["--max-tokens", str(int(max_tokens_budget))])
+    if max_duration_sec is not None:
+        cmd.extend(["--max-duration", str(float(max_duration_sec))])
     if trace_export_dir is not None:
         try:
             export_arg = trace_export_dir.resolve().relative_to(repo_path.resolve()).as_posix()
@@ -976,10 +1170,30 @@ def run_evolution_cycle(
     pr_mode: str = "none",
     pr_base: str | None = None,
     adaptive_trials: bool | None = None,
+    max_tasks: int | None = None,
+    max_cycle_tokens: int | None = None,
+    max_cycle_timeout_sec: float | None = None,
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
+    cycle_started = time.monotonic()
     repo = repo_root.resolve()
     config = load_rsi_config(repo)
+    rrsi_cfg = dict(config.get("rrsi") or {})
+    if max_tasks is not None:
+        rrsi_cfg["max_tasks"] = int(max_tasks)
+    if max_cycle_tokens is not None:
+        rrsi_cfg["max_cycle_tokens"] = int(max_cycle_tokens)
+    if max_cycle_timeout_sec is not None:
+        rrsi_cfg["max_cycle_timeout_sec"] = float(max_cycle_timeout_sec)
+    config["rrsi"] = rrsi_cfg
+
+    eff_max_tasks = int(rrsi_cfg["max_tasks"]) if rrsi_cfg.get("max_tasks") is not None else None
+    eff_max_cycle_tokens = int(rrsi_cfg["max_cycle_tokens"]) if rrsi_cfg.get("max_cycle_tokens") is not None else None
+    eff_max_cycle_timeout = (
+        float(rrsi_cfg["max_cycle_timeout_sec"])
+        if rrsi_cfg.get("max_cycle_timeout_sec") is not None
+        else None
+    )
     plugin_cfg = config.get("plugins") if isinstance(config.get("plugins"), dict) else {}
     active_proposer = load_plugin(
         proposer if proposer is not None else plugin_cfg.get("proposer"),
@@ -1079,11 +1293,21 @@ def run_evolution_cycle(
     repo_head_branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() or "main"
     root_node = archive.ensure_root(commit_sha=repo_head_sha, branch=repo_head_branch)
 
+    secondary_parent_node = None
+    crossover_meta: dict[str, Any] | None = None
     if parent_node_id is not None:
         selected_parent = archive.get_node(parent_node_id)
         if selected_parent is None:
             raise ValueError(f"Unknown parent_node_id: {parent_node_id}")
         parent_node = selected_parent
+        base_sha = parent_node.commit_sha or head_sha
+    elif parent_strategy == "crossover":
+        pair = archive.sample_crossover_parents(seed=seed)
+        if pair is not None:
+            parent_node, secondary_parent_node = pair
+            crossover_meta = _build_crossover_context(repo, parent_node, secondary_parent_node, config)
+        else:
+            parent_node = archive.sample_parent(strategy="dgm", seed=seed) or root_node
         base_sha = parent_node.commit_sha or head_sha
     elif parent_strategy != "head":
         parent_node = archive.sample_parent(strategy=parent_strategy, seed=seed) or root_node
@@ -1092,6 +1316,12 @@ def run_evolution_cycle(
         matching = [n for n in archive.nodes.values() if n.commit_sha == head_sha]
         parent_node = matching[-1] if matching else root_node
         base_sha = head_sha
+
+    crossover_parent_ids = (
+        [parent_node.node_id, secondary_parent_node.node_id]
+        if secondary_parent_node is not None
+        else [parent_node.node_id]
+    )
 
     run_id = uuid.uuid4().hex[:8]
     sandbox = get_sandbox_adapter(config)
@@ -1151,6 +1381,12 @@ def run_evolution_cycle(
             if wt_traces_dir.is_dir():
                 shutil.copytree(wt_traces_dir, repo / ".rsi" / "traces", dirs_exist_ok=True)
 
+        cycle_tokens_used = (
+            int((train_baseline or {}).get("total_tokens", 0) or 0)
+            + int(baseline_report.get("total_tokens", 0) or 0)
+            + int((ood_baseline or {}).get("total_tokens", 0) or 0)
+        )
+
         if root_node.metadata.get("metrics_initialized") is not True and parent_node.commit_sha == root_node.commit_sha:
             root_node.pass_rate = float(baseline_report.get("pass_rate", 0.0))
             root_node.total_tokens = float(baseline_report.get("total_tokens", 0.0))
@@ -1161,6 +1397,10 @@ def run_evolution_cycle(
             archive.recompute_novelty()
 
         trace_ctx = _collect_trace_context(worktree_dir)
+        history_reflection = _build_history_reflection(history)
+        proposal_metadata: dict[str, Any] = {"history_reflection": history_reflection}
+        if crossover_meta is not None:
+            proposal_metadata["crossover_parents"] = crossover_meta
 
         proposer_note = active_proposer.propose(
             ProposalContext(
@@ -1172,6 +1412,7 @@ def run_evolution_cycle(
                 config=config,
                 mock_bad_proposal=mock_bad_proposal,
                 parent_node_id=parent_node.node_id,
+                metadata=proposal_metadata,
             )
         )
 
@@ -1218,9 +1459,11 @@ def run_evolution_cycle(
                 "evolution_mode": evolution_mode,
                 "mined_clusters": mined_clusters,
                 "split_mode": split_mode,
-                "n_trials": n_trials,
+                "n_trials": eval_n_trials,
                 "parent_strategy": parent_strategy,
                 "parent_node_id": parent_node.node_id,
+                "secondary_parent_id": secondary_parent_node.node_id if secondary_parent_node else None,
+                "crossover_parent_ids": crossover_parent_ids,
                 "lineage_node_id": None,
                 "node_branch": None,
                 "pareto_frontier_ids": pareto_ids,
@@ -1229,6 +1472,80 @@ def run_evolution_cycle(
                 "stage": "proposal_critic",
                 "reasons": prop_reasons,
                 "proposer_note": proposer_note,
+                "cycle_tokens_used": cycle_tokens_used,
+                "cost_budget": {
+                    "max_tasks": eff_max_tasks,
+                    "max_cycle_tokens": eff_max_cycle_tokens,
+                    "max_cycle_timeout_sec": eff_max_cycle_timeout,
+                },
+                "baseline": baseline_report,
+                "train_baseline": train_baseline,
+                "ood_baseline": ood_baseline,
+                "candidate": None,
+                "ood_candidate": None,
+                "store_generation": gen_rec["generation"],
+                "store_dir": gen_rec["snapshot_dir"],
+                **prop_meta,
+            }
+            _maybe_handle_pr(repo, record, pr_mode=pr_mode, pr_base=pr_base, diff_text=diff_text)
+            append_jsonl(history_path, record)
+            return record
+
+        def _check_cycle_budget() -> str | None:
+            if eff_max_cycle_tokens is not None and cycle_tokens_used > eff_max_cycle_tokens:
+                return f"cycle_token_budget_exceeded:{cycle_tokens_used}>{eff_max_cycle_tokens}"
+            elapsed = time.monotonic() - cycle_started
+            if eff_max_cycle_timeout is not None and elapsed > eff_max_cycle_timeout:
+                return f"cycle_timeout_budget_exceeded:{round(elapsed, 2)}>{eff_max_cycle_timeout}"
+            return None
+
+        budget_violation = _check_cycle_budget()
+        if budget_violation is not None:
+            archive.save()
+            pareto_ids = [n.node_id for n in archive.pareto_frontier()]
+            gen_rec = store.record_generation(
+                run_id=run_id,
+                branch=branch,
+                parent_sha=base_sha,
+                commit_sha=None,
+                accepted=False,
+                stage="cost_budget_guard",
+                reasons=[budget_violation],
+                diff_text=diff_text,
+                changed_files=list(prop_meta.get("changed_files", [])),
+                config=config,
+                baseline_report=baseline_report,
+                candidate_report=None,
+                traces_src_dir=wt_traces_dir,
+                worktree=worktree_dir,
+                proposer_note=proposer_note,
+            )
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id,
+                "branch": branch,
+                "evolution_mode": evolution_mode,
+                "mined_clusters": mined_clusters,
+                "split_mode": split_mode,
+                "n_trials": eval_n_trials,
+                "parent_strategy": parent_strategy,
+                "parent_node_id": parent_node.node_id,
+                "secondary_parent_id": secondary_parent_node.node_id if secondary_parent_node else None,
+                "crossover_parent_ids": crossover_parent_ids,
+                "lineage_node_id": None,
+                "node_branch": None,
+                "pareto_frontier_ids": pareto_ids,
+                "plugins_used": plugins_used,
+                "accepted": False,
+                "stage": "cost_budget_guard",
+                "reasons": [budget_violation],
+                "proposer_note": proposer_note,
+                "cycle_tokens_used": cycle_tokens_used,
+                "cost_budget": {
+                    "max_tasks": eff_max_tasks,
+                    "max_cycle_tokens": eff_max_cycle_tokens,
+                    "max_cycle_timeout_sec": eff_max_cycle_timeout,
+                },
                 "baseline": baseline_report,
                 "train_baseline": train_baseline,
                 "ood_baseline": ood_baseline,
@@ -1253,6 +1570,7 @@ def run_evolution_cycle(
             manifest_path=effective_manifest,
             split=("holdout" if has_holdout else None),
         )
+        cycle_tokens_used += int(candidate_report.get("total_tokens", 0) or 0)
         adaptive_expanded = False
         adaptive_reason = "fixed_trials"
         if adaptive_enabled and max_trials > eval_n_trials:
@@ -1315,29 +1633,37 @@ def run_evolution_cycle(
         sel_reasons = list(sel_diag["reasons"])
 
         if sel_ok and has_ood and ood_baseline is not None:
-            ood_candidate = active_evaluator.evaluate(
-                worktree_dir,
-                runner=runner,
-                config=config,
-                trace_export_dir=None,
-                n_trials=effective_n_trials,
-                sandbox=sandbox,
-                manifest_path=effective_manifest,
-                split="ood",
-            )
-            if rrsi_cfg.get("enforce_anti_goodhart", True) and ood_candidate.get("anti_goodhart_passed") is False:
+            ood_budget_viol = _check_cycle_budget()
+            if ood_budget_viol is not None:
                 sel_ok = False
-                sel_reasons = ["anti_goodhart_verifier_tampered"]
+                sel_reasons = [ood_budget_viol]
                 sel_diag["accepted"] = False
                 sel_diag["reasons"] = list(sel_reasons)
-            elif float(ood_candidate.get("pass_rate", 0.0)) < float(ood_baseline.get("pass_rate", 0.0)) - max_ood_reg:
-                sel_ok = False
-                sel_reasons = [
-                    f"ood_generalization_regressed:{float(ood_candidate['pass_rate']):.3f}"
-                    f"<{float(ood_baseline['pass_rate']):.3f}"
-                ]
-                sel_diag["accepted"] = False
-                sel_diag["reasons"] = list(sel_reasons)
+            else:
+                ood_candidate = active_evaluator.evaluate(
+                    worktree_dir,
+                    runner=runner,
+                    config=config,
+                    trace_export_dir=None,
+                    n_trials=effective_n_trials,
+                    sandbox=sandbox,
+                    manifest_path=effective_manifest,
+                    split="ood",
+                )
+                cycle_tokens_used += int(ood_candidate.get("total_tokens", 0) or 0)
+                if rrsi_cfg.get("enforce_anti_goodhart", True) and ood_candidate.get("anti_goodhart_passed") is False:
+                    sel_ok = False
+                    sel_reasons = ["anti_goodhart_verifier_tampered"]
+                    sel_diag["accepted"] = False
+                    sel_diag["reasons"] = list(sel_reasons)
+                elif float(ood_candidate.get("pass_rate", 0.0)) < float(ood_baseline.get("pass_rate", 0.0)) - max_ood_reg:
+                    sel_ok = False
+                    sel_reasons = [
+                        f"ood_generalization_regressed:{float(ood_candidate['pass_rate']):.3f}"
+                        f"<{float(ood_baseline['pass_rate']):.3f}"
+                    ]
+                    sel_diag["accepted"] = False
+                    sel_diag["reasons"] = list(sel_reasons)
 
         commit_sha = None
         lineage_node_id: str | None = None
@@ -1367,6 +1693,7 @@ def run_evolution_cycle(
             archive.add_node(
                 node_id=lineage_node_id,
                 parent_id=parent_node.node_id,
+                secondary_parent_id=secondary_parent_node.node_id if secondary_parent_node else None,
                 commit_sha=commit_sha,
                 branch=node_branch,
                 pass_rate=float(candidate_report.get("pass_rate", 0.0)),
@@ -1377,6 +1704,7 @@ def run_evolution_cycle(
                 metadata={
                     "run_id": run_id,
                     "parent_strategy": parent_strategy,
+                    "secondary_parent_id": secondary_parent_node.node_id if secondary_parent_node else None,
                     "proposer_note": proposer_note,
                 },
             )
@@ -1387,6 +1715,12 @@ def run_evolution_cycle(
             pareto_ids = [n.node_id for n in archive.pareto_frontier()]
 
         archive.save()
+        task_attribution_summary = build_task_diff_reflection(
+            baseline_report,
+            candidate_report,
+            changed_files=list(prop_meta.get("changed_files", [])),
+            proposer_note=proposer_note,
+        )
 
         gen_rec = store.record_generation(
             run_id=run_id,
@@ -1418,6 +1752,8 @@ def run_evolution_cycle(
             "adaptive_trials": adaptive_info,
             "parent_strategy": parent_strategy,
             "parent_node_id": parent_node.node_id,
+            "secondary_parent_id": secondary_parent_node.node_id if secondary_parent_node else None,
+            "crossover_parent_ids": crossover_parent_ids,
             "lineage_node_id": lineage_node_id,
             "node_branch": node_branch,
             "pareto_frontier_ids": pareto_ids,
@@ -1427,6 +1763,13 @@ def run_evolution_cycle(
             "stage": "selection_gate",
             "reasons": sel_reasons,
             "selection_diagnostics": sel_diag,
+            "task_attribution_summary": task_attribution_summary,
+            "cycle_tokens_used": cycle_tokens_used,
+            "cost_budget": {
+                "max_tasks": eff_max_tasks,
+                "max_cycle_tokens": eff_max_cycle_tokens,
+                "max_cycle_timeout_sec": eff_max_cycle_timeout,
+            },
             "proposer_note": proposer_note,
             "baseline": baseline_report,
             "train_baseline": train_baseline,
@@ -1464,7 +1807,7 @@ def main() -> None:
     parser.add_argument(
         "--parent-strategy",
         default="head",
-        choices=["head", "dgm", "latest", "best"],
+        choices=["head", "dgm", "latest", "best", "crossover"],
         help="Parent selection strategy from lineage archive (head preserves branch-head evolution)",
     )
     parser.add_argument(
@@ -1505,6 +1848,9 @@ def main() -> None:
         default=None,
         help="Enable/disable adaptive multi-trial evaluation expansion",
     )
+    parser.add_argument("--max-tasks", type=int, default=None, help="Maximum benchmark tasks per evaluation")
+    parser.add_argument("--max-cycle-tokens", type=int, default=None, help="Token budget ceiling for the evolution cycle")
+    parser.add_argument("--max-cycle-timeout", type=float, default=None, help="Wall-clock timeout budget (seconds) for the cycle")
     args = parser.parse_args()
 
     pr_mode = "create" if args.create_pr else ("dry-run" if args.pr_dry_run else "none")
@@ -1522,6 +1868,9 @@ def main() -> None:
         pr_mode=pr_mode,
         pr_base=args.pr_base,
         adaptive_trials=args.adaptive_trials,
+        max_tasks=args.max_tasks,
+        max_cycle_tokens=args.max_cycle_tokens,
+        max_cycle_timeout_sec=args.max_cycle_timeout,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

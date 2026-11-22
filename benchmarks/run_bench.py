@@ -913,6 +913,8 @@ def _run_single_trial(
     enforce_anti_goodhart: bool = True,
     lock_harness_during_eval: bool = True,
     config: dict[str, Any] | None = None,
+    max_tokens_budget: int | None = None,
+    max_duration_sec: float | None = None,
 ) -> dict[str, Any]:
     cfg = config if config is not None else load_rsi_config(repo_root)
     results: list[dict[str, Any]] = []
@@ -926,10 +928,21 @@ def _run_single_trial(
     total_effective_cost = 0.0
     tampered_tasks: list[str] = []
     behavior_failed_tasks: list[str] = []
+    budget_stopped = False
+    budget_stop_reason: str | None = None
     started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="rsi-bench-") as tmp_root:
         for task in tasks:
+            if results:
+                if max_tokens_budget is not None and total_tokens >= int(max_tokens_budget):
+                    budget_stopped = True
+                    budget_stop_reason = f"max_tokens_budget_reached:{total_tokens}>={int(max_tokens_budget)}"
+                    break
+                if max_duration_sec is not None and (time.monotonic() - started) >= float(max_duration_sec):
+                    budget_stopped = True
+                    budget_stop_reason = f"max_duration_sec_reached:{round(time.monotonic() - started, 2)}>={max_duration_sec}"
+                    break
             task_id = task["id"]
             task_dir = Path(tmp_root) / task_id
             verifier_stage_dir = Path(tmp_root) / "_verifiers" / task_id
@@ -1097,11 +1110,14 @@ def _run_single_trial(
             )
 
     total = len(tasks)
+    executed = len(results)
+    denom = executed if executed else total
     return {
         "trial": trial_idx,
         "total_tasks": total,
+        "executed_tasks": executed,
         "passed_tasks": passed_count,
-        "pass_rate": round(passed_count / total, 4) if total else 0.0,
+        "pass_rate": round(passed_count / denom, 4) if denom else 0.0,
         "total_tokens": total_tokens,
         "effective_token_cost": round(total_effective_cost, 4),
         "input_tokens": total_input_tokens,
@@ -1114,6 +1130,8 @@ def _run_single_trial(
         "tampered_tasks": sorted(set(tampered_tasks)),
         "behavior_passed": len(behavior_failed_tasks) == 0,
         "behavior_failed_tasks": sorted(set(behavior_failed_tasks)),
+        "budget_stopped": budget_stopped,
+        "budget_stop_reason": budget_stop_reason,
         "tasks": results,
     }
 
@@ -1126,14 +1144,21 @@ def run_benchmark(
     n_trials: int = 1,
     sandbox_backend: str | None = None,
     split: str | list[str] | None = None,
+    max_tasks: int | None = None,
+    max_tokens_budget: int | None = None,
+    max_duration_sec: float | None = None,
 ) -> dict[str, Any]:
     """Execute benchmark suite over ``n_trials`` isolated runs and aggregate metrics."""
     if n_trials < 1:
         raise ValueError(f"n_trials must be >= 1, got {n_trials}")
+    if max_tasks is not None and int(max_tasks) < 1:
+        raise ValueError(f"max_tasks must be >= 1, got {max_tasks}")
 
     manifest = load_benchmark_suite(manifest_path)
     rules_text = _load_rules_text(repo_root)
     tasks, split_label = _filter_tasks_by_split(manifest.get("tasks", []), split)
+    if max_tasks is not None:
+        tasks = tasks[: int(max_tasks)]
     cfg = load_rsi_config(repo_root)
     runtime_config = cfg.get("runtime") if isinstance(cfg.get("runtime"), dict) else None
     rrsi_cfg = cfg.get("rrsi") or {}
@@ -1144,34 +1169,57 @@ def run_benchmark(
         _ = get_sandbox_adapter({"sandbox": {**(cfg.get("sandbox") or {}), "backend": sandbox_backend}})
 
     trials: list[dict[str, Any]] = []
+    suite_started = time.monotonic()
+    cumulative_tokens = 0
     for trial_idx in range(1, n_trials + 1):
-        trials.append(
-            _run_single_trial(
-                repo_root,
-                tasks,
-                rules_text,
-                runner,
-                trace_export_dir,
-                trial_idx=trial_idx,
-                n_trials=n_trials,
-                runtime_config=runtime_config,
-                enforce_anti_goodhart=enforce_ag,
-                lock_harness_during_eval=lock_harness,
-                config=cfg,
-            )
+        if trials:
+            if max_tokens_budget is not None and cumulative_tokens >= int(max_tokens_budget):
+                break
+            if max_duration_sec is not None and (time.monotonic() - suite_started) >= float(max_duration_sec):
+                break
+        remaining_tokens = (
+            max(1, int(max_tokens_budget) - cumulative_tokens)
+            if max_tokens_budget is not None
+            else None
         )
+        remaining_dur = (
+            max(0.01, float(max_duration_sec) - (time.monotonic() - suite_started))
+            if max_duration_sec is not None
+            else None
+        )
+        trial_res = _run_single_trial(
+            repo_root,
+            tasks,
+            rules_text,
+            runner,
+            trace_export_dir,
+            trial_idx=trial_idx,
+            n_trials=n_trials,
+            runtime_config=runtime_config,
+            enforce_anti_goodhart=enforce_ag,
+            lock_harness_during_eval=lock_harness,
+            config=cfg,
+            max_tokens_budget=remaining_tokens,
+            max_duration_sec=remaining_dur,
+        )
+        trials.append(trial_res)
+        cumulative_tokens += int(trial_res.get("total_tokens", 0))
 
     stats = aggregate_trial_metrics(trials)
     mean_passed = statistics.mean(float(t["passed_tasks"]) for t in trials) if trials else 0.0
     all_tampered = sorted({tid for t in trials for tid in t.get("tampered_tasks", [])})
     all_behavior_failed = sorted({tid for t in trials for tid in t.get("behavior_failed_tasks", [])})
+    budget_reasons = [str(t["budget_stop_reason"]) for t in trials if t.get("budget_stop_reason")]
+    budget_stopped = any(bool(t.get("budget_stopped")) for t in trials) or len(trials) < n_trials
+    mean_executed = statistics.mean(float(t.get("executed_tasks", t["total_tasks"])) for t in trials) if trials else 0.0
     total = len(tasks)
     return {
         "suite": manifest.get("suite_name", "mini-bench"),
         "runner": runner,
         "split": split_label,
-        "n_trials": n_trials,
+        "n_trials": len(trials),
         "total_tasks": total,
+        "executed_tasks": int(round(mean_executed)),
         "passed_tasks": int(round(mean_passed)),
         "pass_rate": round(stats["pass_rate"]["mean"], 4),
         "total_tokens": int(round(stats["total_tokens"]["mean"])),
@@ -1186,6 +1234,8 @@ def run_benchmark(
         "tampered_tasks": all_tampered,
         "behavior_passed": len(all_behavior_failed) == 0,
         "behavior_failed_tasks": all_behavior_failed,
+        "budget_stopped": budget_stopped,
+        "budget_stop_reasons": budget_reasons,
         "stats": stats,
         "trials": trials,
         "tasks": trials[-1]["tasks"] if trials else [],
@@ -1223,9 +1273,14 @@ def main() -> None:
         choices=["worktree", "docker", "remote"],
         help="Optional sandbox backend validation override",
     )
+    parser.add_argument("--max-tasks", type=int, default=None, help="Maximum number of tasks to execute")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Token budget cap across tasks")
+    parser.add_argument("--max-duration", type=float, default=None, help="Duration budget cap (seconds)")
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be >= 1")
+    if args.max_tasks is not None and args.max_tasks < 1:
+        parser.error("--max-tasks must be >= 1")
 
     repo_root = Path(args.repo).resolve()
     manifest_path = Path(args.manifest)
@@ -1241,6 +1296,9 @@ def main() -> None:
         n_trials=args.trials,
         sandbox_backend=args.sandbox_backend,
         split=args.split,
+        max_tasks=args.max_tasks,
+        max_tokens_budget=args.max_tokens,
+        max_duration_sec=args.max_duration,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

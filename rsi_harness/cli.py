@@ -287,6 +287,9 @@ def _cmd_evolve(args: argparse.Namespace) -> int:
         pr_mode=pr_mode,
         pr_base=args.pr_base,
         adaptive_trials=args.adaptive_trials,
+        max_tasks=args.max_tasks,
+        max_cycle_tokens=args.max_cycle_tokens,
+        max_cycle_timeout_sec=args.max_cycle_timeout,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -459,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_evolve.add_argument("--manifest", default=None, help="Optional benchmark manifest or Harbor directory")
     p_evolve.add_argument("--mode", default="auto", choices=["auto", "benchmark", "trace-mined"])
     p_evolve.add_argument("--prune", action="store_true", help="Prune redundant rules / dead skills in candidate worktree")
-    p_evolve.add_argument("--parent-strategy", default="head", choices=["head", "dgm", "latest", "best"])
+    p_evolve.add_argument("--parent-strategy", default="head", choices=["head", "dgm", "latest", "best", "crossover"])
     p_evolve.add_argument("--parent-node-id", default=None)
     p_evolve.add_argument("--seed", type=int, default=None)
     p_evolve.add_argument("--pr-dry-run", action="store_true")
@@ -471,6 +474,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Enable/disable adaptive multi-trial evaluation expansion",
     )
+    p_evolve.add_argument("--max-tasks", type=int, default=None, help="Maximum benchmark tasks per evaluation")
+    p_evolve.add_argument("--max-cycle-tokens", type=int, default=None, help="Token budget ceiling for the evolution cycle")
+    p_evolve.add_argument("--max-cycle-timeout", type=float, default=None, help="Wall-clock timeout budget (seconds) for the cycle")
     p_evolve.add_argument("--mock-bad-proposal", default=None, choices=["leak", "budget", "protected"])
     p_evolve.set_defaults(func=_cmd_evolve)
 
@@ -494,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_lineage = sub.add_parser("lineage", help="Inspect DGM evolutionary DAG and Pareto frontier")
     p_lineage.add_argument("--repo", default=".", help="Target repository path or lineage.json")
     p_lineage.add_argument("--pareto", action="store_true", help="Show Pareto frontier nodes only")
-    p_lineage.add_argument("--sample", default=None, choices=["dgm", "latest", "best"])
+    p_lineage.add_argument("--sample", default=None, choices=["dgm", "latest", "best", "crossover"])
     p_lineage.add_argument("--seed", type=int, default=None)
     p_lineage.add_argument("--json", action="store_true", help="Emit JSON output")
     p_lineage.set_defaults(func=_cmd_lineage)

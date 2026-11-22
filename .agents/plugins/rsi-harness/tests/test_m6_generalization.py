@@ -29,6 +29,7 @@ from common import compute_effective_token_cost, load_jsonl, load_rsi_config  # 
 from evolve_outer import (  # noqa: E402
     _build_proposer_prompt,
     build_leakage_fingerprint,
+    build_task_diff_reflection,
     compute_selection_diagnostics,
     evaluate_selection_gate,
     merge_benchmark_reports,
@@ -38,6 +39,7 @@ from evolve_outer import (  # noqa: E402
 )
 from git_bench_miner import is_impl_file, is_test_file, mine_git_regression_suite  # noqa: E402
 from guard_harness import evaluate_tool_guard  # noqa: E402
+from lineage import LineageArchive  # noqa: E402
 from pr_reporter import create_review_pr, detect_default_branch, generate_pr_report  # noqa: E402
 from run_bench import run_benchmark  # noqa: E402
 from surface import load_yaml_file, resolve_mutable_surface  # noqa: E402
@@ -989,6 +991,215 @@ class M6GitBenchMinerTests(unittest.TestCase):
                 any("test_zero_division_guard" in r for r in reasons_leak),
                 reasons_leak,
             )
+
+
+class M6GepaCrossoverAndBudgetTests(unittest.TestCase):
+    def test_task_diff_reflection_detects_cross_task_tradeoff(self) -> None:
+        baseline = {
+            "tasks": [
+                {"id": "mined_01", "passed": True, "tokens": 2000, "tool_calls": 5, "steps": 6},
+                {"id": "mined_02", "passed": True, "tokens": 1500, "tool_calls": 4, "steps": 5},
+                {"id": "mined_03", "passed": True, "tokens": 1000, "tool_calls": 4, "steps": 5},
+            ]
+        }
+        candidate = {
+            "tasks": [
+                {"id": "mined_01", "passed": True, "tokens": 1760, "tool_calls": 4, "steps": 5},
+                {"id": "mined_02", "passed": True, "tokens": 1500, "tool_calls": 4, "steps": 5},
+                {"id": "mined_03", "passed": True, "tokens": 1101, "tool_calls": 6, "steps": 7},
+            ]
+        }
+        refl = build_task_diff_reflection(
+            baseline,
+            candidate,
+            changed_files=["AGENTS.md"],
+            proposer_note="Added extra check",
+        )
+        self.assertTrue(refl["tradeoff_detected"])
+        self.assertEqual(refl["improved_tasks"], ["mined_01"])
+        self.assertEqual(refl["regressed_tasks"], ["mined_03"])
+        by_id = {d["id"]: d for d in refl["per_task"]}
+        self.assertAlmostEqual(by_id["mined_01"]["tokens_delta_pct"], -12.0)
+        self.assertAlmostEqual(by_id["mined_03"]["tokens_delta_pct"], 10.1)
+        self.assertEqual(by_id["mined_03"]["tool_calls_delta"], 2)
+
+    def test_lineage_crossover_sampling_and_evolve_crossover_with_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            (repo / ".gitignore").write_text(".rsi/\n__pycache__/\n", encoding="utf-8")
+            (repo / "AGENTS.md").write_text("# Base Rules\n- Keep things clean.\n", encoding="utf-8")
+            (repo / "harness.yaml").write_text(
+                """
+rrsi:
+  n_trials: 1
+  max_files: 2
+  max_rules_bytes: 8000
+mutable_surface:
+  - path: "AGENTS.md"
+    role: "rules"
+""",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "RSI"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "rsi@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            root_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            # Create two complementary Pareto branches in git + LineageArchive
+            subprocess.run(["git", "checkout", "-b", "rsi/node-pass"], cwd=repo, check=True, capture_output=True)
+            (repo / "AGENTS.md").write_text(
+                "# Base Rules\n- Check empty and zero boundary cases carefully.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "AGENTS.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "pass branch"], cwd=repo, check=True, capture_output=True)
+            pass_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "rsi/node-tok"], cwd=repo, check=True, capture_output=True)
+            (repo / "AGENTS.md").write_text(
+                "# Base Rules\n- Be concise and verify split() once.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "AGENTS.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "tok branch"], cwd=repo, check=True, capture_output=True)
+            tok_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+
+            archive = LineageArchive.load(repo)
+            archive.ensure_root(commit_sha=root_sha, branch="main", pass_rate=0.3, total_tokens=6000)
+            archive.add_node(
+                node_id="node-pass",
+                parent_id="root",
+                commit_sha=pass_sha,
+                branch="rsi/node-pass",
+                pass_rate=0.9,
+                total_tokens=4000,
+                changed_files=["AGENTS.md"],
+                metadata={"proposer_note": "High accuracy branch"},
+            )
+            archive.add_node(
+                node_id="node-tok",
+                parent_id="root",
+                commit_sha=tok_sha,
+                branch="rsi/node-tok",
+                pass_rate=0.6,
+                total_tokens=1500,
+                changed_files=["AGENTS.md"],
+                metadata={"proposer_note": "Low token branch"},
+            )
+            archive.save()
+
+            pair = archive.sample_crossover_parents()
+            self.assertIsNotNone(pair)
+            assert pair is not None
+            self.assertEqual(pair[0].node_id, "node-pass")
+            self.assertEqual(pair[1].node_id, "node-tok")
+
+            # Seed history with a trade-off record so reflection context is populated
+            from common import append_jsonl
+
+            append_jsonl(
+                repo / ".rsi" / "evolution_history.jsonl",
+                {
+                    "run_id": "prev1",
+                    "accepted": False,
+                    "task_attribution_summary": {
+                        "per_task": [{"id": "task_01_edge_case", "tokens_delta_pct": -10.0}],
+                        "improved_tasks": ["task_01_edge_case"],
+                        "regressed_tasks": ["task_03_multi_file_rule"],
+                        "tradeoff_detected": True,
+                    },
+                },
+            )
+
+            seen_metadata: dict[str, object] = {}
+
+            class _CrossoverInspectProposer:
+                def propose(self, context: object) -> str:
+                    seen_metadata.update(context.metadata)  # type: ignore[attr-defined]
+                    prompt = _build_proposer_prompt(
+                        context.worktree_dir,  # type: ignore[attr-defined]
+                        context.trace_context,  # type: ignore[attr-defined]
+                        context.history,  # type: ignore[attr-defined]
+                        config=context.config,  # type: ignore[attr-defined]
+                        metadata=context.metadata,  # type: ignore[attr-defined]
+                    )
+                    seen_metadata["rendered_prompt"] = prompt
+                    (context.worktree_dir / "AGENTS.md").write_text(  # type: ignore[attr-defined]
+                        "# Synthesized Rules\n"
+                        "- Check empty and zero boundary cases.\n"
+                        "- Verify split() and public signature/constants then re-run unittest once.\n",
+                        encoding="utf-8",
+                    )
+                    return "Synthesized crossover rules"
+
+            manifest = root / "tasks.json"
+            shutil.copy2(REPO_ROOT / "benchmarks" / "tasks.json", manifest)
+
+            res = run_evolution_cycle(
+                repo,
+                branch="rsi/evolved",
+                runner="mock",
+                manifest_path=manifest,
+                parent_strategy="crossover",
+                proposer=_CrossoverInspectProposer(),
+            )
+            self.assertTrue(res["accepted"], res)
+            self.assertEqual(res["parent_node_id"], "node-pass")
+            self.assertEqual(res["secondary_parent_id"], "node-tok")
+            self.assertEqual(res["crossover_parent_ids"], ["node-pass", "node-tok"])
+            self.assertIn("task_attribution_summary", res)
+            self.assertIn("crossover_parents", seen_metadata)
+            self.assertIn("GEPA Task Attribution Reflection", str(seen_metadata["rendered_prompt"]))
+            self.assertIn("Pareto Crossover Synthesis", str(seen_metadata["rendered_prompt"]))
+
+            # Secondary parent persisted in LineageArchive
+            reloaded = LineageArchive.load(repo)
+            child_node = reloaded.get_node(res["lineage_node_id"])
+            self.assertIsNotNone(child_node)
+            assert child_node is not None
+            self.assertEqual(child_node.secondary_parent_id, "node-tok")
+
+            # CLI --max-tasks 1 limits evaluation to 1 task
+            cli_proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "rsi_harness",
+                    "evolve",
+                    "--repo",
+                    str(repo),
+                    "--runner",
+                    "mock",
+                    "--manifest",
+                    str(manifest),
+                    "--max-tasks",
+                    "1",
+                ],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            cli_res = json.loads(cli_proc.stdout)
+            self.assertEqual(cli_res["baseline"]["total_tasks"], 1)
+
+            # Cycle cost budget guard aborts before candidate evaluation when max_cycle_tokens exceeded
+            budget_res = run_evolution_cycle(
+                repo,
+                branch="rsi/evolved",
+                runner="mock",
+                manifest_path=manifest,
+                max_cycle_tokens=100,
+            )
+            self.assertFalse(budget_res["accepted"])
+            self.assertEqual(budget_res["stage"], "cost_budget_guard")
+            self.assertTrue(any("cycle_token_budget_exceeded" in r for r in budget_res["reasons"]))
 
 
 if __name__ == "__main__":

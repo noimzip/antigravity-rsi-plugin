@@ -75,6 +75,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "early_reject_pass_rate_drop": 0.05,
             "early_reject_token_overhead_ratio": 0.15,
         },
+        "max_tasks": None,
+        "max_cycle_tokens": None,
+        "max_cycle_timeout_sec": None,
         "annealing": {
             "enabled": True,
             "decay_rate": 0.85,

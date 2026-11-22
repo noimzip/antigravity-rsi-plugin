@@ -26,6 +26,7 @@ class LineageNode:
     commit_sha: str
     branch: str
     generation: int
+    secondary_parent_id: str | None = None
     pass_rate: float = 0.0
     total_tokens: float = 0.0
     latency_ms: float = 0.0
@@ -44,6 +45,7 @@ class LineageNode:
         return cls(
             node_id=str(data["node_id"]),
             parent_id=data.get("parent_id"),
+            secondary_parent_id=data.get("secondary_parent_id"),
             commit_sha=str(data.get("commit_sha", "")),
             branch=str(data.get("branch", "")),
             generation=int(data.get("generation", 0)),
@@ -182,6 +184,7 @@ class LineageArchive:
         *,
         node_id: str | None = None,
         parent_id: str | None = None,
+        secondary_parent_id: str | None = None,
         commit_sha: str = "",
         branch: str = "",
         generation: int | None = None,
@@ -201,6 +204,7 @@ class LineageArchive:
             node = LineageNode(
                 node_id=resolved_id,
                 parent_id=parent_id,
+                secondary_parent_id=secondary_parent_id,
                 commit_sha=commit_sha,
                 branch=branch,
                 generation=resolved_gen,
@@ -307,13 +311,42 @@ class LineageArchive:
             score = 0.5 * nearest_dist + 0.3 * avg_dist + 0.2 * hash_uniqueness
             n.novelty_score = round(max(0.0, min(1.0, score)), 4)
 
+    def sample_crossover_parents(
+        self, seed: int | None = None
+    ) -> tuple[LineageNode, LineageNode] | None:
+        """Select complementary Pareto parent pair ``(highest_pass_rate, lowest_tokens)``."""
+        if len(self.nodes) < 2:
+            return None
+        frontier = self.pareto_frontier()
+        pool = frontier if len(frontier) >= 2 else list(self.nodes.values())
+        primary = min(
+            pool,
+            key=lambda n: (-n.pass_rate, n.total_tokens, n.latency_ms, -n.generation, n.node_id),
+        )
+        others = [n for n in pool if n.node_id != primary.node_id]
+        if not others:
+            others = [n for n in self.nodes.values() if n.node_id != primary.node_id]
+        if not others:
+            return None
+        secondary = min(
+            others,
+            key=lambda n: (n.total_tokens, -n.pass_rate, -n.novelty_score, n.latency_ms, n.node_id),
+        )
+        return primary, secondary
+
     def sample_parent(self, strategy: str = "dgm", seed: int | None = None) -> LineageNode | None:
-        """Select a parent node using `dgm`, `best`, or `latest` strategy."""
+        """Select a parent node using `dgm`, `best`, `latest`, or `crossover` strategy."""
         if not self.nodes:
             return None
 
         ordered = list(self.nodes.values())
         norm_strategy = (strategy or "dgm").strip().lower()
+
+        if norm_strategy == "crossover":
+            pair = self.sample_crossover_parents(seed=seed)
+            if pair is not None:
+                return pair[0]
+            return self.sample_parent("best", seed=seed)
 
         if norm_strategy == "latest":
             return max(
@@ -397,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pareto", action="store_true", help="Output only Pareto frontier nodes")
     parser.add_argument(
         "--sample",
-        choices=["dgm", "latest", "best"],
+        choices=["dgm", "latest", "best", "crossover"],
         default=None,
         help="Sample a parent node using the given strategy",
     )
@@ -407,6 +440,20 @@ def main(argv: list[str] | None = None) -> int:
 
     archive = LineageArchive.load(args.repo.resolve())
     if args.sample:
+        if args.sample == "crossover":
+            pair = archive.sample_crossover_parents(seed=args.seed)
+            if args.json:
+                print(
+                    json.dumps(
+                        {"primary": pair[0].to_dict(), "secondary": pair[1].to_dict()}
+                        if pair
+                        else None,
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"{pair[0].node_id},{pair[1].node_id}" if pair else "No crossover pair available")
+            return 0
         chosen = archive.sample_parent(strategy=args.sample, seed=args.seed)
         if args.json:
             print(json.dumps(chosen.to_dict() if chosen else None, indent=2))
