@@ -23,6 +23,17 @@ ALWAYS_PROTECTED = (
     ".agents/plugins/rsi-harness/scripts/",
     "benchmarks/",
 )
+EVAL_PROTECTED_HARNESS = (
+    "AGENTS.md",
+    "CLAUDE.md",
+    "harness.yaml",
+    "harness.yml",
+    "rsi.config.json",
+    "skills/",
+    ".agents/skills/",
+    ".agents/plugins/rsi-harness/rules/",
+    ".agents/plugins/rsi-harness/skills/",
+)
 
 _PATH_ARG_KEYS = ("Path", "TargetFile", "path", "file_path")
 _CMD_ARG_KEYS = ("CommandLine", "command")
@@ -688,16 +699,32 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
     """Evaluate PreToolUse boundary rules from a runtime-agnostic ``NormalizedToolPreEvent``."""
     cwd_path = Path(event.cwd or ".")
     config = load_rsi_config(cwd_path)
+    evo_mode = os.environ.get("RSI_EVOLUTION_MODE") == "1"
+    eval_mode = os.environ.get("RSI_EVAL_MODE") == "1"
+    strict_deny = evo_mode or eval_mode
+
+    extra_eval_protected: list[str] = []
+    if eval_mode:
+        extra_eval_protected.extend(EVAL_PROTECTED_HARNESS)
+        for item in config.get("mutable_surface") or []:
+            if isinstance(item, str) and item.strip():
+                extra_eval_protected.append(item.strip())
+            elif isinstance(item, dict) and item.get("path"):
+                extra_eval_protected.append(str(item["path"]).strip())
+        for pref in config.get("rrsi", {}).get("editable_prefixes", []) or []:
+            if str(pref).strip():
+                extra_eval_protected.append(str(pref).strip())
+
     raw_protected = (
         tuple(config.get("protected_surface", []))
         + tuple(config.get("rrsi", {}).get("protected_prefixes", []))
         + ALWAYS_PROTECTED
+        + tuple(extra_eval_protected)
     )
     prefix_protected = tuple(p for p in raw_protected if not any(c in str(p) for c in "*?["))
     glob_protected = tuple(_strip_dot_slash(str(p)) for p in raw_protected if any(c in str(p) for c in "*?["))
     protected_paths = _build_protected_paths(cwd_path, prefix_protected)
 
-    evo_mode = os.environ.get("RSI_EVOLUTION_MODE") == "1"
     allowed_root_raw = os.environ.get("RSI_ALLOWED_ROOT", "").strip()
     allowed_root = Path(allowed_root_raw) if (evo_mode and allowed_root_raw) else None
 
@@ -708,7 +735,7 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
         for gpat in glob_protected:
             if fnmatch.fnmatch(rel_norm, gpat):
                 return {
-                    "decision": "deny" if evo_mode else "ask",
+                    "decision": "deny" if strict_deny else "ask",
                     "reason": (
                         f"Protected RSI surface pattern matched ({gpat}). "
                         "Approve explicitly or use Outer Loop evolution mode."
@@ -721,6 +748,8 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
             val, cwd_path, protected_paths, allowed_root, evo_mode
         )
         if decision is not None:
+            if strict_deny and decision.get("decision") == "ask":
+                decision = {**decision, "decision": "deny"}
             return decision
         glob_dec = _check_globs(val)
         if glob_dec is not None:
@@ -738,6 +767,8 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
                 allow_safe_devices=True,
             )
             if decision is not None:
+                if strict_deny and decision.get("decision") == "ask":
+                    decision = {**decision, "decision": "deny"}
                 return decision
             glob_dec = _check_globs(target)
             if glob_dec is not None:
@@ -747,7 +778,7 @@ def evaluate_normalized_tool_guard(event: NormalizedToolPreEvent) -> dict[str, A
             for clean_prefix, _, _ in protected_paths:
                 if clean_prefix in normalized_cmd:
                     return {
-                        "decision": "deny" if evo_mode else "ask",
+                        "decision": "deny" if strict_deny else "ask",
                         "reason": (
                             f"Suspicious shell command referencing protected target ({clean_prefix}). "
                             "Approve explicitly or use Outer Loop evolution mode."

@@ -57,6 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pareto_tie_epsilon": 0.005,
         "max_ood_regression": 0.05,
         "enforce_anti_goodhart": True,
+        "lock_harness_during_eval": True,
         "max_rules_bytes": 24000,
         "rules_budget_mode": "standard",
         "max_skills_bytes": None,

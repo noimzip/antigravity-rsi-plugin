@@ -258,12 +258,24 @@ def mine_weaknesses(
     return clusters
 
 
+def _default_behavior_assertions(cluster: WeaknessCluster, cfg: dict[str, Any]) -> dict[str, Any]:
+    retries = max(1, int(cfg.get("max_inner_retries", 2)))
+    if cluster.category == "tool_error_chain":
+        return {"max_consecutive_errors": 2}
+    if cluster.category in {"retry_exhaustion", "stop_failure"}:
+        return {"max_errors": retries}
+    if cluster.category == "high_token_usage":
+        return {"max_tool_calls": 20}
+    return {}
+
+
 def synthesize_regression_suite(
     repo_root: Path,
     clusters: list[WeaknessCluster],
     *,
     max_tasks: int = 5,
     output_path: Path | None = None,
+    behavior_assertions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Synthesize a Harbor-compatible regression suite from mined weakness clusters."""
     repo = repo_root.resolve()
@@ -284,6 +296,15 @@ def synthesize_regression_suite(
             if cluster.sample_errors
             else ""
         )
+        derived_assertions = _default_behavior_assertions(cluster, cfg)
+        if behavior_assertions:
+            derived_assertions.update(behavior_assertions)
+        verifier_block: dict[str, Any] = {
+            "command": verifier_cmd,
+            "timeout_sec": verifier_timeout,
+        }
+        if derived_assertions:
+            verifier_block["behavior_assertions"] = derived_assertions
         tasks.append(
             {
                 "id": f"mined_{idx:02d}_{cluster.category}",
@@ -299,10 +320,7 @@ def synthesize_regression_suite(
                     "type": "directory",
                     "source_dir": str(repo),
                 },
-                "verifier": {
-                    "command": verifier_cmd,
-                    "timeout_sec": verifier_timeout,
-                },
+                "verifier": verifier_block,
                 "weakness_cluster": asdict(cluster),
             }
         )

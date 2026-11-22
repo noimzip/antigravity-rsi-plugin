@@ -111,13 +111,16 @@ class AgentRuntimeAdapter(ABC):
         *,
         evolution_mode: bool = False,
         allowed_root: Path | None = None,
+        eval_mode: bool = False,
     ) -> dict[str, str]:
-        """Construct subprocess environment with optional RSI evolution boundary vars."""
+        """Construct subprocess environment with optional RSI evolution/eval boundary vars."""
         env = dict(base_env if base_env is not None else os.environ)
         if evolution_mode:
             env["RSI_EVOLUTION_MODE"] = "1"
             if allowed_root is not None:
                 env["RSI_ALLOWED_ROOT"] = str(allowed_root.resolve())
+        if eval_mode:
+            env["RSI_EVAL_MODE"] = "1"
         return env
 
     @abstractmethod
@@ -149,6 +152,7 @@ class AgentRuntimeAdapter(ABC):
         timeout_sec: int = 120,
         evolution_mode: bool = False,
         allowed_root: Path | None = None,
+        eval_mode: bool = False,
         model: str | None = None,
         extra_args: list[str] | None = None,
     ) -> RuntimeRunResult:
@@ -162,7 +166,11 @@ class AgentRuntimeAdapter(ABC):
             model=str(eff_model) if eff_model else None,
             extra_args=eff_extra_list,
         )
-        env = self.build_env(evolution_mode=evolution_mode, allowed_root=allowed_root)
+        env = self.build_env(
+            evolution_mode=evolution_mode,
+            allowed_root=allowed_root,
+            eval_mode=eval_mode,
+        )
         started = time.monotonic()
         try:
             proc = subprocess.run(
@@ -533,6 +541,7 @@ class PtyWrapperAdapter(AgentRuntimeAdapter):
         timeout_sec: int = 120,
         evolution_mode: bool = False,
         allowed_root: Path | None = None,
+        eval_mode: bool = False,
         model: str | None = None,
         extra_args: list[str] | None = None,
     ) -> RuntimeRunResult:
@@ -545,7 +554,11 @@ class PtyWrapperAdapter(AgentRuntimeAdapter):
             model=str(eff_model) if eff_model else None,
             extra_args=eff_extra_list,
         )
-        env = self.build_env(evolution_mode=evolution_mode, allowed_root=allowed_root)
+        env = self.build_env(
+            evolution_mode=evolution_mode,
+            allowed_root=allowed_root,
+            eval_mode=eval_mode,
+        )
         started = time.monotonic()
 
         chunks: list[bytes] = []
@@ -560,6 +573,7 @@ class PtyWrapperAdapter(AgentRuntimeAdapter):
                 timeout_sec=timeout_sec,
                 evolution_mode=evolution_mode,
                 allowed_root=allowed_root,
+                eval_mode=eval_mode,
                 model=model,
                 extra_args=extra_args,
             )

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import statistics
@@ -367,8 +369,15 @@ def _run_agy_task(
     task_dir: Path,
     timeout_sec: int = 120,
     runtime_config: dict[str, Any] | None = None,
+    *,
+    eval_mode: bool = False,
 ) -> tuple[int, str]:
-    res = AgyAdapter(runtime_config).run(prompt, task_dir, timeout_sec=timeout_sec)
+    res = AgyAdapter(runtime_config).run(
+        prompt,
+        task_dir,
+        timeout_sec=timeout_sec,
+        eval_mode=eval_mode,
+    )
     return res.total_tokens, res.raw_output[:500]
 
 
@@ -379,12 +388,13 @@ def _run_adapter_task(
     *,
     runtime_config: dict[str, Any] | None = None,
     timeout_sec: int = 120,
+    eval_mode: bool = False,
 ) -> tuple[int, str]:
     eff_timeout = int((runtime_config or {}).get("timeout_sec", timeout_sec))
     if runner == "agy" and not runtime_config:
-        return _run_agy_task(prompt, task_dir, timeout_sec=eff_timeout)
+        return _run_agy_task(prompt, task_dir, timeout_sec=eff_timeout, eval_mode=eval_mode)
     adapter = get_runtime_adapter(runner, runtime_config)
-    res = adapter.run(prompt, task_dir, timeout_sec=eff_timeout)
+    res = adapter.run(prompt, task_dir, timeout_sec=eff_timeout, eval_mode=eval_mode)
     return res.total_tokens, (res.raw_output or res.stderr)[:500]
 
 
@@ -586,6 +596,217 @@ def _filter_tasks_by_split(
     return filtered, ",".join(sorted(allowed))
 
 
+def _identify_harness_files(
+    task: dict[str, Any],
+    task_dir: Path,
+    repo_root: Path,
+) -> list[Path]:
+    """Identify harness rule, config, and skill files inside ``task_dir``."""
+    found: list[Path] = []
+    seen: set[Path] = set()
+    task_res = task_dir.resolve()
+
+    def _add(p: Path) -> None:
+        if p.is_file() and not p.is_symlink():
+            res = p.resolve()
+            if res.is_relative_to(task_res) and res not in seen:
+                seen.add(res)
+                found.append(p)
+
+    for root_name in ("AGENTS.md", "CLAUDE.md", "harness.yaml", "harness.yml"):
+        _add(task_dir / root_name)
+
+    for base in (
+        task_dir / "skills",
+        task_dir / ".agents" / "skills",
+        task_dir / ".agents" / "plugins" / "rsi-harness" / "rules",
+        task_dir / ".agents" / "plugins" / "rsi-harness" / "skills",
+    ):
+        if base.is_dir():
+            for item in sorted(base.rglob("*")):
+                if item.is_file():
+                    _add(item)
+
+    cfg = load_rsi_config(repo_root)
+    surface = resolve_mutable_surface(repo_root, cfg)
+    for item in surface.list_existing_files(task_dir):
+        _add(item)
+
+    return found
+
+
+_READ_TOOL_NAMES = {
+    "read_file",
+    "read",
+    "view_file",
+    "view_file_outline",
+    "view_code_item",
+    "grep_search",
+    "find_by_name",
+    "cat",
+}
+
+
+def _collect_task_trace_metrics(task_dir: Path) -> dict[str, Any]:
+    """Aggregate tool calls, steps, error chains, commands, read paths, and token breakdown."""
+    traces_dir = task_dir / ".rsi" / "traces"
+    metrics: dict[str, Any] = {
+        "tool_calls": 0,
+        "steps": 0,
+        "errors": 0,
+        "max_consecutive_errors": 0,
+        "commands": [],
+        "read_paths": [],
+        "input_tokens": 0,
+        "cache_read_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    if not traces_dir.is_dir():
+        return metrics
+
+    for conv_dir in sorted(traces_dir.iterdir()):
+        if not conv_dir.is_dir():
+            continue
+        summary: dict[str, Any] = {}
+        sum_file = conv_dir / "summary.json"
+        if sum_file.is_file():
+            try:
+                loaded = json.loads(sum_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    summary = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        for tok_k in ("input_tokens", "cache_read_tokens", "output_tokens", "total_tokens"):
+            val = summary.get(tok_k)
+            if isinstance(val, int):
+                metrics[tok_k] += val
+
+        ev_file = conv_dir / "events.jsonl"
+        ev_rows: list[dict[str, Any]] = []
+        if ev_file.is_file():
+            for raw_ln in ev_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                raw_ln = raw_ln.strip()
+                if not raw_ln:
+                    continue
+                try:
+                    row = json.loads(raw_ln)
+                    if isinstance(row, dict):
+                        ev_rows.append(row)
+                except json.JSONDecodeError:
+                    continue
+
+        ev_tool_calls = 0
+        ev_errors = 0
+        consec = 0
+        for row in ev_rows:
+            tool_name = str(row.get("toolName") or "").strip()
+            ev_name = str(row.get("event") or "").strip().lower()
+            is_tool = ev_name == "post_tool" or bool(tool_name)
+            if is_tool and tool_name:
+                ev_tool_calls += 1
+            elif ev_name == "post_tool":
+                ev_tool_calls += 1
+
+            err = row.get("error")
+            if err:
+                ev_errors += 1
+                consec += 1
+                metrics["max_consecutive_errors"] = max(metrics["max_consecutive_errors"], consec)
+            else:
+                consec = 0
+
+            tool_args = row.get("toolArgs") if isinstance(row.get("toolArgs"), dict) else {}
+            for cmd_key in ("CommandLine", "command"):
+                cmd_val = tool_args.get(cmd_key)
+                if isinstance(cmd_val, str) and cmd_val.strip():
+                    metrics["commands"].append(cmd_val.strip())
+            if tool_name.lower() in _READ_TOOL_NAMES:
+                for p_key in ("Path", "TargetFile", "path", "file_path"):
+                    p_val = tool_args.get(p_key)
+                    if isinstance(p_val, str) and p_val.strip():
+                        metrics["read_paths"].append(p_val.strip().replace("\\", "/"))
+
+        metrics["steps"] += max(len(ev_rows), int(summary.get("steps") or 0))
+        metrics["tool_calls"] += max(ev_tool_calls, int(summary.get("tool_calls") or 0))
+        metrics["errors"] += max(ev_errors, int(summary.get("errors") or 0))
+
+    return metrics
+
+
+def _evaluate_behavior_assertions(
+    task: dict[str, Any],
+    trace_metrics: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Evaluate optional trace-based behavioral assertions for a benchmark task."""
+    assertions: dict[str, Any] = {}
+    if isinstance(task.get("behavior_assertions"), dict):
+        assertions.update(task["behavior_assertions"])
+    verifier = task.get("verifier")
+    if isinstance(verifier, dict) and isinstance(verifier.get("behavior_assertions"), dict):
+        assertions.update(verifier["behavior_assertions"])
+
+    if not assertions:
+        return True, []
+
+    violations: list[str] = []
+    if assertions.get("max_tool_calls") is not None:
+        limit = int(assertions["max_tool_calls"])
+        actual = int(trace_metrics.get("tool_calls", 0))
+        if actual > limit:
+            violations.append(f"max_tool_calls_exceeded:{actual}>{limit}")
+
+    steps_limit_raw = assertions.get("max_steps")
+    if steps_limit_raw is None:
+        steps_limit_raw = assertions.get("max_turns")
+    if steps_limit_raw is not None:
+        limit = int(steps_limit_raw)
+        actual = int(trace_metrics.get("steps", 0))
+        if actual > limit:
+            violations.append(f"max_steps_exceeded:{actual}>{limit}")
+
+    if assertions.get("max_consecutive_errors") is not None:
+        limit = int(assertions["max_consecutive_errors"])
+        actual = int(trace_metrics.get("max_consecutive_errors", 0))
+        if actual > limit:
+            violations.append(f"max_consecutive_errors_exceeded:{actual}>{limit}")
+
+    if assertions.get("max_errors") is not None:
+        limit = int(assertions["max_errors"])
+        actual = int(trace_metrics.get("errors", 0))
+        if actual > limit:
+            violations.append(f"max_errors_exceeded:{actual}>{limit}")
+
+    for pat in assertions.get("forbidden_commands") or []:
+        pat_str = str(pat)
+        matched = False
+        for cmd in trace_metrics.get("commands") or []:
+            if pat_str in cmd:
+                matched = True
+                break
+            try:
+                if re.search(pat_str, cmd):
+                    matched = True
+                    break
+            except re.error:
+                pass
+        if matched:
+            violations.append(f"forbidden_command:{pat_str}")
+
+    for pat in assertions.get("forbidden_read_paths") or []:
+        pat_str = str(pat).replace("\\", "/")
+        matched = False
+        for rp in trace_metrics.get("read_paths") or []:
+            if pat_str in rp or fnmatch.fnmatch(rp, pat_str):
+                matched = True
+                break
+        if matched:
+            violations.append(f"forbidden_read_path:{pat_str}")
+
+    return len(violations) == 0, violations
+
+
 def _run_single_trial(
     repo_root: Path,
     tasks: list[dict[str, Any]],
@@ -596,11 +817,13 @@ def _run_single_trial(
     n_trials: int,
     runtime_config: dict[str, Any] | None = None,
     enforce_anti_goodhart: bool = True,
+    lock_harness_during_eval: bool = True,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     passed_count = 0
     total_tokens = 0
     tampered_tasks: list[str] = []
+    behavior_failed_tasks: list[str] = []
     started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="rsi-bench-") as tmp_root:
@@ -611,15 +834,30 @@ def _run_single_trial(
             task_dir.mkdir(parents=True, exist_ok=True)
             _materialize_task(task, task_dir, repo_root)
 
+            verifier_cfg = task.get("verifier") if isinstance(task.get("verifier"), dict) else {}
             verifier_files = _identify_verifier_files(task, task_dir)
             pre_hashes = _hash_files(task_dir, verifier_files)
-            ro_enabled = enforce_anti_goodhart and bool(
-                (task.get("verifier") or {}).get("readonly", True)
-            )
+            ro_enabled = enforce_anti_goodhart and bool(verifier_cfg.get("readonly", True))
+
+            if "lock_harness_during_eval" in task:
+                lock_harness = enforce_anti_goodhart and bool(task["lock_harness_during_eval"])
+            elif "lock_harness_during_eval" in verifier_cfg:
+                lock_harness = enforce_anti_goodhart and bool(verifier_cfg["lock_harness_during_eval"])
+            else:
+                lock_harness = enforce_anti_goodhart and lock_harness_during_eval
+
+            harness_files = _identify_harness_files(task, task_dir, repo_root) if lock_harness else []
+            harness_pre_hashes = _hash_files(task_dir, harness_files) if lock_harness else {}
+
             tamper_violations: list[str] = []
+            behavior_ok = True
+            behavior_violations: list[str] = []
+            trace_metrics: dict[str, Any] = {}
             try:
                 if ro_enabled and verifier_files:
                     _set_readonly(verifier_files, True)
+                if lock_harness and harness_files:
+                    _set_readonly(harness_files, True)
 
                 if runner == "mock":
                     tokens, note = _apply_mock_solution(task_id, task_dir, rules_text)
@@ -629,10 +867,24 @@ def _run_single_trial(
                         task.get("prompt", ""),
                         task_dir,
                         runtime_config=runtime_config,
+                        eval_mode=lock_harness,
                     )
 
                 if enforce_anti_goodhart and pre_hashes:
-                    tamper_violations = _verify_integrity(task_dir, pre_hashes)
+                    tamper_violations.extend(_verify_integrity(task_dir, pre_hashes))
+
+                if lock_harness:
+                    for h_viol in _verify_integrity(task_dir, harness_pre_hashes):
+                        tamper_violations.append(f"harness_{h_viol}")
+                    post_harness_rels = {
+                        p.resolve().relative_to(task_dir.resolve()).as_posix()
+                        for p in _identify_harness_files(task, task_dir, repo_root)
+                    }
+                    for created_rel in sorted(post_harness_rels - set(harness_pre_hashes.keys())):
+                        tamper_violations.append(f"harness_created:{created_rel}")
+
+                trace_metrics = _collect_task_trace_metrics(task_dir)
+                behavior_ok, behavior_violations = _evaluate_behavior_assertions(task, trace_metrics)
 
                 if tamper_violations:
                     passed = False
@@ -642,9 +894,15 @@ def _run_single_trial(
                     grade = _run_task_verifier(task, task_dir, verifier_stage_dir)
                     passed = grade.returncode == 0
                     grader_tail = (grade.stderr or grade.stdout)[-300:]
+                    if not behavior_ok:
+                        passed = False
+                        behavior_failed_tasks.append(task_id)
+                        grader_tail = f"{grader_tail}\nBEHAVIOR_ASSERTIONS_FAILED: {behavior_violations}".strip()[-300:]
             finally:
                 if verifier_files:
                     _set_readonly(verifier_files, False)
+                if harness_files:
+                    _set_readonly(harness_files, False)
 
             if passed:
                 passed_count += 1
@@ -668,6 +926,9 @@ def _run_single_trial(
                     "passed": passed,
                     "tampered": bool(tamper_violations),
                     "tamper_violations": tamper_violations,
+                    "behavior_passed": behavior_ok,
+                    "behavior_violations": behavior_violations,
+                    "trace_metrics": trace_metrics,
                     "tokens": tokens,
                     "note": note,
                     "grader_tail": grader_tail,
@@ -684,6 +945,8 @@ def _run_single_trial(
         "duration_sec": round(time.monotonic() - started, 3),
         "anti_goodhart_passed": len(tampered_tasks) == 0,
         "tampered_tasks": sorted(set(tampered_tasks)),
+        "behavior_passed": len(behavior_failed_tasks) == 0,
+        "behavior_failed_tasks": sorted(set(behavior_failed_tasks)),
         "tasks": results,
     }
 
@@ -706,7 +969,9 @@ def run_benchmark(
     tasks, split_label = _filter_tasks_by_split(manifest.get("tasks", []), split)
     cfg = load_rsi_config(repo_root)
     runtime_config = cfg.get("runtime") if isinstance(cfg.get("runtime"), dict) else None
-    enforce_ag = bool((cfg.get("rrsi") or {}).get("enforce_anti_goodhart", True))
+    rrsi_cfg = cfg.get("rrsi") or {}
+    enforce_ag = bool(rrsi_cfg.get("enforce_anti_goodhart", True))
+    lock_harness = bool(rrsi_cfg.get("lock_harness_during_eval", True))
     if sandbox_backend:
         # Validate requested sandbox adapter early via registry factory
         _ = get_sandbox_adapter({"sandbox": {**(cfg.get("sandbox") or {}), "backend": sandbox_backend}})
@@ -724,12 +989,14 @@ def run_benchmark(
                 n_trials=n_trials,
                 runtime_config=runtime_config,
                 enforce_anti_goodhart=enforce_ag,
+                lock_harness_during_eval=lock_harness,
             )
         )
 
     stats = aggregate_trial_metrics(trials)
     mean_passed = statistics.mean(float(t["passed_tasks"]) for t in trials) if trials else 0.0
     all_tampered = sorted({tid for t in trials for tid in t.get("tampered_tasks", [])})
+    all_behavior_failed = sorted({tid for t in trials for tid in t.get("behavior_failed_tasks", [])})
     total = len(tasks)
     return {
         "suite": manifest.get("suite_name", "mini-bench"),
@@ -743,6 +1010,8 @@ def run_benchmark(
         "duration_sec": round(stats["duration_sec"]["mean"], 3),
         "anti_goodhart_passed": len(all_tampered) == 0,
         "tampered_tasks": all_tampered,
+        "behavior_passed": len(all_behavior_failed) == 0,
+        "behavior_failed_tasks": all_behavior_failed,
         "stats": stats,
         "trials": trials,
         "tasks": trials[-1]["tasks"] if trials else [],
