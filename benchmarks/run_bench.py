@@ -166,7 +166,12 @@ def _materialize_task(task: dict[str, Any], dest: Path, repo_root: Path) -> dict
                         check=True,
                         timeout=30,
                     )
-                shutil.copytree(clone_dir, dest, dirs_exist_ok=True)
+                shutil.copytree(
+                    clone_dir,
+                    dest,
+                    ignore=shutil.ignore_patterns(".git"),
+                    dirs_exist_ok=True,
+                )
 
         if env_cfg.get("setup_cmd"):
             setup_env = dict(os.environ)
@@ -316,6 +321,53 @@ def _apply_mock_solution(task_id: str, task_dir: Path, rules_text: str) -> tuple
     return 1500 + extra_tokens, "mock_unknown"
 
 
+def _apply_verifier_test_patch(
+    verifier: dict[str, Any],
+    task_dir: Path,
+    base_dir: Path,
+) -> tuple[bool, str]:
+    """Apply ``verifier.test_patch`` or ``verifier.test_patch_file`` inside ``task_dir``."""
+    patch_text = ""
+    if isinstance(verifier.get("test_patch"), str) and verifier["test_patch"].strip():
+        patch_text = verifier["test_patch"]
+    elif verifier.get("test_patch_file"):
+        pf = Path(str(verifier["test_patch_file"]))
+        if not pf.is_absolute():
+            pf = (base_dir / pf).resolve()
+        if pf.is_file():
+            patch_text = pf.read_text(encoding="utf-8", errors="replace")
+    if not patch_text:
+        return True, ""
+
+    git_apply = subprocess.run(
+        ["git", "apply", "--whitespace=nowarn", "-"],
+        cwd=str(task_dir),
+        input=patch_text,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if git_apply.returncode == 0:
+        return True, ""
+
+    patch_bin = shutil.which("patch")
+    if patch_bin:
+        patch_run = subprocess.run(
+            [patch_bin, "-p1", "--batch"],
+            cwd=str(task_dir),
+            input=patch_text,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if patch_run.returncode == 0:
+            return True, ""
+        return False, f"test_patch apply failed: {git_apply.stderr.strip()} | {patch_run.stderr.strip()}"
+    return False, f"test_patch apply failed: {git_apply.stderr.strip()}"
+
+
 def _run_task_verifier(
     task: dict[str, Any],
     task_dir: Path,
@@ -326,6 +378,14 @@ def _run_task_verifier(
     if isinstance(verifier, dict):
         timeout_sec = int(verifier.get("timeout_sec", 30))
         base_dir = Path(str(task.get("_base_dir") or task_dir))
+        ok_patch, patch_err = _apply_verifier_test_patch(verifier, task_dir, base_dir)
+        if not ok_patch:
+            return subprocess.CompletedProcess(
+                args=["test_patch"],
+                returncode=1,
+                stdout="",
+                stderr=patch_err,
+            )
         if verifier.get("script"):
             script_src = Path(str(verifier["script"]))
             if not script_src.is_absolute():
@@ -562,7 +622,7 @@ def _identify_verifier_files(task: dict[str, Any], task_dir: Path) -> list[Path]
 
     verifier = task.get("verifier")
     if isinstance(verifier, dict):
-        for raw_rel in verifier.get("readonly_paths") or []:
+        for raw_rel in list(verifier.get("readonly_paths") or []) + list(verifier.get("test_files") or []):
             p = (task_dir / str(raw_rel)).resolve(strict=False)
             if p.is_file() and p.is_relative_to(task_dir.resolve()) and p not in seen:
                 seen.add(p)
@@ -944,6 +1004,8 @@ def _run_single_trial(
                     tampered_tasks.append(task_id)
                     grader_tail = f"ANTI_GOODHART_TAMPER_DETECTED: {tamper_violations}"
                 else:
+                    if verifier_files and (verifier_cfg.get("test_patch") or verifier_cfg.get("test_patch_file")):
+                        _set_readonly(verifier_files, False)
                     grade = _run_task_verifier(task, task_dir, verifier_stage_dir)
                     passed = grade.returncode == 0
                     grader_tail = (grade.stderr or grade.stdout)[-300:]

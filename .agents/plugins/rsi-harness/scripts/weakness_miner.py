@@ -19,6 +19,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from common import load_jsonl, load_rsi_config  # noqa: E402
+from git_bench_miner import mine_git_regression_suite  # noqa: E402
 from toolchain import resolve_inner_check  # noqa: E402
 
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
@@ -337,6 +338,28 @@ def synthesize_regression_suite(
             encoding="utf-8",
         )
     return suite
+
+
+def synthesize_git_regression_suite(
+    repo_root: Path,
+    *,
+    max_commits: int = 50,
+    max_tasks: int = 5,
+    split: str = "train",
+    check_cmd: str | None = None,
+    verify: bool = True,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    """Synthesize a Fail-to-Pass benchmark suite from git commit history."""
+    return mine_git_regression_suite(
+        repo_root,
+        max_commits=max_commits,
+        max_tasks=max_tasks,
+        split=split,
+        check_cmd=check_cmd,
+        verify=verify,
+        output_path=output_path,
+    )
 
 
 def main() -> None:

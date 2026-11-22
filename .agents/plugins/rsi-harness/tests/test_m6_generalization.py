@@ -28,6 +28,7 @@ from budget_and_pruning import analyze_pruning_candidates, apply_pruning_pass  #
 from common import compute_effective_token_cost, load_jsonl, load_rsi_config  # noqa: E402
 from evolve_outer import (  # noqa: E402
     _build_proposer_prompt,
+    build_leakage_fingerprint,
     compute_selection_diagnostics,
     evaluate_selection_gate,
     merge_benchmark_reports,
@@ -35,6 +36,7 @@ from evolve_outer import (  # noqa: E402
     should_expand_adaptive_trials,
     validate_proposal_rrsi,
 )
+from git_bench_miner import is_impl_file, is_test_file, mine_git_regression_suite  # noqa: E402
 from guard_harness import evaluate_tool_guard  # noqa: E402
 from pr_reporter import create_review_pr, detect_default_branch, generate_pr_report  # noqa: E402
 from run_bench import run_benchmark  # noqa: E402
@@ -820,6 +822,173 @@ class M6AdaptiveTrialsAndCostTests(unittest.TestCase):
                 {"rrsi": {"adaptive_trials": adaptive_cfg}},
             )
             self.assertTrue(ok_exp)
+
+
+class M6GitBenchMinerTests(unittest.TestCase):
+    def test_polyglot_test_and_impl_classifiers(self) -> None:
+        self.assertTrue(is_test_file("tests/test_app.py"))
+        self.assertTrue(is_test_file("src/utils.test.ts"))
+        self.assertTrue(is_test_file("pkg/calc_test.go"))
+        self.assertTrue(is_impl_file("src/utils.ts"))
+        self.assertFalse(is_impl_file("README.md"))
+        self.assertFalse(is_impl_file("tests/test_app.py"))
+
+    def test_mine_from_git_fail_to_pass_benchmark_and_anti_goodhart_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "app_repo"
+            (repo / "src").mkdir(parents=True)
+            (repo / "tests").mkdir(parents=True)
+            (repo / ".gitignore").write_text(".rsi/\n__pycache__/\n", encoding="utf-8")
+            (repo / "AGENTS.md").write_text("# App Rules\n- Handle edge inputs.\n", encoding="utf-8")
+            (repo / "pyproject.toml").write_text('[project]\nname="app"\n', encoding="utf-8")
+            (repo / "src" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "calc.py").write_text(
+                "def safe_div(a: float, b: float) -> float:\n    return a / b\n",
+                encoding="utf-8",
+            )
+            (repo / "tests" / "test_calc.py").write_text(
+                "import unittest\nfrom src.calc import safe_div\n\n"
+                "class CalcTests(unittest.TestCase):\n"
+                "    def test_basic(self):\n"
+                "        self.assertEqual(safe_div(6, 2), 3.0)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "RSI"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "rsi@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init buggy calc"], cwd=repo, check=True, capture_output=True)
+
+            # Commit 2: unrelated doc commit (should be ignored)
+            (repo / "README.md").write_text("# Calc App\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "docs: add readme"], cwd=repo, check=True, capture_output=True)
+            pre_fix_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            # Commit 3: actual Fail-to-Pass bugfix commit with regression test
+            (repo / "src" / "calc.py").write_text(
+                "def safe_div(a: float, b: float) -> float:\n"
+                "    if b == 0:\n"
+                "        return 0.0\n"
+                "    return a / b\n",
+                encoding="utf-8",
+            )
+            (repo / "tests" / "test_calc.py").write_text(
+                "import unittest\nfrom src.calc import safe_div\n\n"
+                "class CalcTests(unittest.TestCase):\n"
+                "    def test_basic(self):\n"
+                "        self.assertEqual(safe_div(6, 2), 3.0)\n\n"
+                "    def test_zero_division_guard(self):\n"
+                "        self.assertEqual(safe_div(10, 0), 0.0)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "fix: return 0.0 on zero divisor"], cwd=repo, check=True, capture_output=True)
+            fix_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            # Commit 4: refactor+test commit that already passed at pre-commit (not Fail-to-Pass, must be filtered out!)
+            (repo / "src" / "calc.py").write_text(
+                "def safe_div(a: float, b: float) -> float:\n"
+                "    return 0.0 if b == 0 else a / b\n",
+                encoding="utf-8",
+            )
+            (repo / "tests" / "test_calc.py").write_text(
+                "import unittest\nfrom src.calc import safe_div\n\n"
+                "class CalcTests(unittest.TestCase):\n"
+                "    def test_basic(self):\n"
+                "        self.assertEqual(safe_div(6, 2), 3.0)\n\n"
+                "    def test_zero_division_guard(self):\n"
+                "        self.assertEqual(safe_div(10, 0), 0.0)\n\n"
+                "    def test_negative(self):\n"
+                "        self.assertEqual(safe_div(-6, 2), -3.0)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "test: add negative test and ternary"], cwd=repo, check=True, capture_output=True)
+
+            manifest_out = root / "git_holdout.json"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "rsi_harness",
+                    "mine",
+                    "--repo",
+                    str(repo),
+                    "--from-git",
+                    "--split",
+                    "holdout",
+                    "--output",
+                    str(manifest_out),
+                    "--json",
+                ],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            mined = json.loads(proc.stdout)
+            self.assertEqual(mined["verified_count"], 1, mined)
+            self.assertEqual(len(mined["tasks"]), 1)
+            task = mined["tasks"][0]
+            self.assertEqual(task["split"], "holdout")
+            self.assertEqual(task["environment"]["git_ref"], pre_fix_sha)
+            self.assertEqual(task["git_bug_pair"]["fix_commit"], fix_sha)
+            self.assertIn("test_zero_division_guard", task["verifier"]["test_patch"])
+
+            # Without fix (mock) -> pre_commit + transplanted test FAILS
+            fail_rep = run_benchmark(repo, manifest_out, runner="mock")
+            self.assertEqual(fail_rep["passed_tasks"], 0)
+
+            # With fake agy fixing src/calc.py (verifying hidden test & .git are NOT exposed during eval)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_agy = bin_dir / "agy"
+            fake_agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "from pathlib import Path\n"
+                "assert not Path('.git').exists(), '.git history must not leak into eval workspace'\n"
+                "test_txt = Path('tests/test_calc.py').read_text(encoding='utf-8')\n"
+                "assert 'test_zero_division_guard' not in test_txt, 'transplanted test leaked before verifier!'\n"
+                "Path('src/calc.py').write_text('def safe_div(a, b):\\n    return 0.0 if b == 0 else a / b\\n', encoding='utf-8')\n"
+                "print(json.dumps({'usage': {'total_tokens': 300}}))\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+            orig_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{orig_path}"
+            try:
+                pass_rep = run_benchmark(repo, manifest_out, runner="agy")
+            finally:
+                os.environ["PATH"] = orig_path
+            self.assertEqual(pass_rep["passed_tasks"], 1)
+
+            # Leakage Critic blocks referencing hidden holdout test identifier or assertion from test_patch
+            fp = build_leakage_fingerprint(mined["tasks"], manifest_out)
+            self.assertIn("test_zero_division_guard", fp["hidden_identifiers"])
+            self.assertIn("test_calc.py", fp["verifier_filenames"])
+
+            head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            cfg = load_rsi_config(repo)
+            (repo / "AGENTS.md").write_text(
+                "# App Rules\n- Check test_zero_division_guard case.\n",
+                encoding="utf-8",
+            )
+            ok_leak, reasons_leak, _ = validate_proposal_rrsi(
+                repo,
+                head_sha,
+                cfg,
+                [],
+                fp["task_ids"],
+                leakage_profile=fp,
+            )
+            self.assertFalse(ok_leak)
+            self.assertTrue(
+                any("test_zero_division_guard" in r for r in reasons_leak),
+                reasons_leak,
+            )
 
 
 if __name__ == "__main__":

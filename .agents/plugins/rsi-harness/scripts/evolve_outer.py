@@ -320,8 +320,12 @@ def _agy_propose(
 
 
 _TEST_DEF_RE = re.compile(r"^\s*def\s+(test_[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
+_GO_TEST_DEF_RE = re.compile(r"^\s*func\s+(Test[A-Za-z0-9_]+)\s*\(", re.MULTILINE)
+_JS_TEST_DEF_RE = re.compile(r"""(?:^|\b)(?:it|test)\(\s*['"]([A-Za-z0-9_ .:-]{8,})['"]""", re.MULTILINE)
 _CLASS_DEF_RE = re.compile(r"^\s*class\s+([A-Za-z0-9_]+)\s*(?:\(|:)", re.MULTILINE)
-_ASSERT_LINE_RE = re.compile(r"(?:assert|assertEqual|assertAlmostEqual|assertRaises|expected)")
+_ASSERT_LINE_RE = re.compile(
+    r"(?:assert|assertEqual|assertAlmostEqual|assertRaises|expected|expect\(|assert\.|assert_eq!|t\.Error|t\.Fatal)"
+)
 
 
 def build_leakage_fingerprint(
@@ -350,7 +354,7 @@ def build_leakage_fingerprint(
         verifier = task.get("verifier")
         ro_paths: set[str] = set()
         if isinstance(verifier, dict):
-            for ro_rel in verifier.get("readonly_paths") or []:
+            for ro_rel in list(verifier.get("readonly_paths") or []) + list(verifier.get("test_files") or []):
                 ro_str = str(ro_rel)
                 ro_paths.add(ro_str)
                 ro_paths.add(Path(ro_str).name)
@@ -364,6 +368,24 @@ def build_leakage_fingerprint(
                         sp = (base_dir / sp).resolve()
                     if sp.is_file():
                         sources_to_scan.append(sp.read_text(encoding="utf-8", errors="replace"))
+            if split in {"holdout", "ood"}:
+                patch_text = ""
+                if isinstance(verifier.get("test_patch"), str) and verifier["test_patch"].strip():
+                    patch_text = verifier["test_patch"]
+                elif verifier.get("test_patch_file"):
+                    pf = Path(str(verifier["test_patch_file"]))
+                    if not pf.is_absolute():
+                        pf = (base_dir / pf).resolve()
+                    if pf.is_file():
+                        patch_text = pf.read_text(encoding="utf-8", errors="replace")
+                if patch_text:
+                    added_patch_lines = [
+                        ln[1:]
+                        for ln in patch_text.splitlines()
+                        if ln.startswith("+") and not ln.startswith("+++")
+                    ]
+                    if added_patch_lines:
+                        sources_to_scan.append("\n".join(added_patch_lines))
 
         files = task.get("files")
         if isinstance(files, dict):
@@ -378,6 +400,10 @@ def build_leakage_fingerprint(
 
         for src_text in sources_to_scan:
             for ident in _TEST_DEF_RE.findall(src_text):
+                hidden_identifiers.add(ident)
+            for ident in _GO_TEST_DEF_RE.findall(src_text):
+                hidden_identifiers.add(ident)
+            for ident in _JS_TEST_DEF_RE.findall(src_text):
                 hidden_identifiers.add(ident)
             for cls_name in _CLASS_DEF_RE.findall(src_text):
                 hidden_identifiers.add(cls_name)

@@ -354,13 +354,49 @@ def _cmd_status(args: argparse.Namespace) -> int:
 def _cmd_mine(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     _ensure_scripts_on_path(repo)
+    if args.from_git:
+        from git_bench_miner import mine_git_regression_suite
+
+        out_path = Path(args.output).resolve() if args.output else None
+        suite = mine_git_regression_suite(
+            repo,
+            max_commits=args.max_commits,
+            max_tasks=args.max_tasks,
+            split=args.split,
+            check_cmd=args.check_cmd,
+            verify=not args.no_verify,
+            output_path=out_path,
+        )
+        payload = {
+            "repo": str(repo),
+            "source": "git",
+            "split": args.split,
+            "candidates_scanned": suite["candidates_scanned"],
+            "verified_count": suite["verified_count"],
+            "rejected": suite.get("rejected", []),
+            "tasks": suite["tasks"],
+            "synthesized_manifest": str(out_path) if out_path else None,
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(
+                f"Mined {suite['verified_count']} Fail-to-Pass task(s) from {suite['candidates_scanned']} "
+                f"git bugfix candidate(s) in {repo} (split={args.split}):"
+            )
+            for task in suite["tasks"]:
+                print(f"  - [{task['split']}] {task['id']}: {task['title']}")
+            if out_path:
+                print(f"Synthesized git regression suite: {out_path}")
+        return 0
+
     from weakness_miner import mine_weaknesses, synthesize_regression_suite
 
     clusters = mine_weaknesses(repo)
     output_file: str | None = None
     if args.output and clusters:
         out_path = Path(args.output).resolve()
-        synthesize_regression_suite(repo, clusters, output_path=out_path)
+        synthesize_regression_suite(repo, clusters, max_tasks=args.max_tasks, output_path=out_path)
         output_file = str(out_path)
     payload = {
         "repo": str(repo),
@@ -443,8 +479,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--json", action="store_true", help="Emit JSON output")
     p_status.set_defaults(func=_cmd_status)
 
-    p_mine = sub.add_parser("mine", help="Mine failure/inefficiency clusters from trace logs")
+    p_mine = sub.add_parser("mine", help="Mine failure/inefficiency clusters from trace logs or git history")
     p_mine.add_argument("--repo", default=".", help="Target repository path")
+    p_mine.add_argument("--from-git", action="store_true", help="Mine Fail-to-Pass bugfix commit pairs from git history")
+    p_mine.add_argument("--split", default="train", choices=["train", "holdout", "ood", "auto"])
+    p_mine.add_argument("--max-tasks", type=int, default=5)
+    p_mine.add_argument("--max-commits", type=int, default=50)
+    p_mine.add_argument("--check-cmd", default=None, help="Override verification command for --from-git")
+    p_mine.add_argument("--no-verify", action="store_true", help="Skip pre-fix fail / post-fix pass verification")
     p_mine.add_argument("--output", default=None, help="Optional path to write synthesized regression manifest JSON")
     p_mine.add_argument("--json", action="store_true", help="Emit JSON output")
     p_mine.set_defaults(func=_cmd_mine)
