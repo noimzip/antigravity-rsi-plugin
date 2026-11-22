@@ -75,7 +75,7 @@ from interfaces import (  # noqa: E402
     load_plugin,
 )
 from lineage import LineageArchive  # noqa: E402
-from pr_reporter import create_review_pr  # noqa: E402
+from pr_reporter import create_review_pr, detect_default_branch  # noqa: E402
 try:
     from run_bench import load_benchmark_suite  # noqa: E402
 except ImportError:
@@ -633,13 +633,14 @@ def _maybe_handle_pr(
     record: dict[str, Any],
     *,
     pr_mode: str,
-    pr_base: str,
+    pr_base: str | None,
     diff_text: str | None = None,
 ) -> None:
     if pr_mode == "none":
         return
+    effective_base = (pr_base or "").strip() or detect_default_branch(repo)
     if pr_mode == "dry-run":
-        pr_res = create_review_pr(repo, record, base_branch=pr_base, dry_run=True, diff_text=diff_text)
+        pr_res = create_review_pr(repo, record, base_branch=effective_base, dry_run=True, diff_text=diff_text)
         record["pr_result"] = pr_res
         record["pr_report_path"] = pr_res["report_path"]
     elif pr_mode == "create":
@@ -651,7 +652,7 @@ def _maybe_handle_pr(
                 "reason": "candidate_not_accepted",
             }
             return
-        pr_res = create_review_pr(repo, record, base_branch=pr_base, dry_run=False, diff_text=diff_text)
+        pr_res = create_review_pr(repo, record, base_branch=effective_base, dry_run=False, diff_text=diff_text)
         record["pr_result"] = pr_res
         record["pr_report_path"] = pr_res["report_path"]
     else:
@@ -673,7 +674,7 @@ def run_evolution_cycle(
     evaluator: Evaluator | str | dict[str, Any] | None = None,
     critic: Critic | str | dict[str, Any] | None = None,
     pr_mode: str = "none",
-    pr_base: str = "main",
+    pr_base: str | None = None,
 ) -> dict[str, Any]:
     """Run one full Meta-Harness + RRSI + SoL-Pi evolution cycle."""
     repo = repo_root.resolve()
@@ -1122,8 +1123,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--pr-base",
-        default="main",
-        help="Base branch for PR report/creation",
+        default=None,
+        help="Base branch for PR report/creation (auto-detected if omitted)",
     )
     args = parser.parse_args()
 

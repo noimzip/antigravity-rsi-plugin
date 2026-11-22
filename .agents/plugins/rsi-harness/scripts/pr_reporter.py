@@ -14,6 +14,52 @@ from typing import Any
 _PROTECTED_BASE_BRANCHES = {"main", "master"}
 
 
+def detect_default_branch(repo_root: Path | None) -> str:
+    """Detect repository default branch from origin/HEAD, main/master refs, or current HEAD."""
+    if repo_root is None or not Path(repo_root).exists():
+        return "main"
+    repo = Path(repo_root).resolve()
+
+    sym = subprocess.run(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if sym.returncode == 0:
+        ref_name = sym.stdout.strip()
+        if ref_name.startswith("origin/"):
+            ref_name = ref_name[len("origin/") :]
+        if ref_name:
+            return ref_name
+
+    for candidate in ("main", "master"):
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{candidate}"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return candidate
+
+    cur = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cur.returncode == 0:
+        cur_branch = cur.stdout.strip()
+        if cur_branch and cur_branch != "HEAD" and not cur_branch.startswith("rsi/"):
+            return cur_branch
+
+    return "main"
+
+
 def _format_metric_row(name: str, baseline: dict[str, Any] | None, candidate: dict[str, Any] | None, key: str) -> str:
     b_val = (baseline or {}).get(key)
     c_val = (candidate or {}).get(key)
@@ -38,11 +84,12 @@ def generate_pr_report(
     record: dict[str, Any],
     repo_root: Path | None = None,
     *,
-    base_branch: str = "main",
+    base_branch: str | None = None,
     diff_text: str | None = None,
     max_diff_chars: int = 4000,
 ) -> str:
     """Render an evidence-backed Markdown summary for a single evolution cycle."""
+    resolved_base = (base_branch or "").strip() or detect_default_branch(repo_root)
     run_id = str(record.get("run_id") or "unknown")
     accepted = bool(record.get("accepted"))
     stage = str(record.get("stage") or "unknown")
@@ -73,7 +120,7 @@ def generate_pr_report(
         "",
         "## Summary",
         f"- **Status**: {'ACCEPTED' if accepted else 'REJECTED'} (stage: `{stage}`)",
-        f"- **Target Branch**: `{head_branch}` -> `{base_branch}`",
+        f"- **Target Branch**: `{head_branch}` -> `{resolved_base}`",
         f"- **Commit SHA**: `{record.get('commit_sha') or 'uncommitted'}`",
         f"- **Mode / Split**: `{record.get('evolution_mode', 'benchmark')}` / `{record.get('split_mode', 'single')}` (trials={record.get('n_trials', 1)})",
         f"- **Lineage**: parent=`{record.get('parent_node_id') or 'root'}`, node=`{record.get('lineage_node_id') or '-'}`, strategy=`{record.get('parent_strategy', 'head')}`",
@@ -133,7 +180,7 @@ def create_review_pr(
     repo_root: Path,
     record: dict[str, Any],
     *,
-    base_branch: str = "main",
+    base_branch: str | None = None,
     head_branch: str | None = None,
     dry_run: bool = False,
     push: bool = True,
@@ -142,13 +189,14 @@ def create_review_pr(
 ) -> dict[str, Any]:
     """Write PR report and either dry-run or open a GitHub PR via ``gh``."""
     repo = repo_root.resolve()
+    resolved_base = (base_branch or "").strip() or detect_default_branch(repo)
     target_head = (head_branch or record.get("node_branch") or record.get("branch") or "").strip()
 
     if not target_head:
         raise ValueError("Refusing to create PR without a non-empty head branch")
     if target_head in _PROTECTED_BASE_BRANCHES:
         raise ValueError(f"Refusing to create PR from protected branch {target_head!r}")
-    if target_head == base_branch.strip():
+    if target_head == resolved_base:
         raise ValueError(f"Refusing to create PR where head == base ({target_head!r})")
     if not dry_run and not record.get("accepted"):
         raise ValueError("Refusing to open a live PR for an unaccepted evolution cycle")
@@ -157,7 +205,7 @@ def create_review_pr(
     reports_dir = repo / ".rsi" / "pr_reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"pr_{run_id}.md"
-    markdown = generate_pr_report(record, repo_root=repo, base_branch=base_branch, diff_text=diff_text)
+    markdown = generate_pr_report(record, repo_root=repo, base_branch=resolved_base, diff_text=diff_text)
     report_path.write_text(markdown, encoding="utf-8")
 
     b_rate = float((record.get("baseline") or {}).get("pass_rate", 0.0))
@@ -171,7 +219,7 @@ def create_review_pr(
         "pr",
         "create",
         "--base",
-        base_branch,
+        resolved_base,
         "--head",
         target_head,
         "--title",
@@ -186,7 +234,7 @@ def create_review_pr(
             "created": False,
             "report_path": str(report_path),
             "head_branch": target_head,
-            "base_branch": base_branch,
+            "base_branch": resolved_base,
             "title": pr_title,
             "commands": [push_cmd, pr_cmd] if push else [pr_cmd],
         }
@@ -210,7 +258,7 @@ def create_review_pr(
         "pr_url": pr_proc.stdout.strip(),
         "report_path": str(report_path),
         "head_branch": target_head,
-        "base_branch": base_branch,
+        "base_branch": resolved_base,
         "title": pr_title,
     }
 
@@ -218,7 +266,7 @@ def create_review_pr(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate or submit an RSI-Harness review PR")
     parser.add_argument("--repo", type=Path, default=Path("."), help="Repository path")
-    parser.add_argument("--base", default="main", help="Base branch for the PR")
+    parser.add_argument("--base", default=None, help="Base branch for the PR (auto-detected if omitted)")
     parser.add_argument("--head", default=None, help="Override head branch")
     parser.add_argument("--dry-run", action="store_true", help="Write report without pushing or opening PR")
     parser.add_argument("--no-push", action="store_true", help="Skip git push before gh pr create")

@@ -58,28 +58,97 @@ def _detect_runtime(repo: Path, requested: str) -> str:
     return "agy"
 
 
-def _render_harness_yaml(runtime: str, check_cmd: str, timeout_sec: int, rules_rel: str) -> str:
-    escaped_cmd = check_cmd.replace('"', '\\"')
-    return (
-        f'runtime: "{runtime}"\n'
-        f'inner_check_cmd: "{escaped_cmd}"\n'
-        f"inner_timeout_sec: {timeout_sec}\n"
-        "rrsi:\n"
-        "  n_trials: 1\n"
-        "  max_files: 3\n"
-        "  max_diff_lines: 80\n"
-        "  max_rules_bytes: 24000\n"
-        "mutable_surface:\n"
-        f'  - path: "{rules_rel}"\n'
-        '    role: "rules"\n'
-        "    max_bytes: 24000\n"
-        '  - path: "skills/*/SKILL.md"\n'
-        '    role: "skills"\n'
-        "protected_surface:\n"
-        '  - ".agents/plugins/rsi-harness/hooks.json"\n'
-        '  - ".agents/plugins/rsi-harness/scripts/"\n'
-        '  - "benchmarks/"\n'
+def _detect_init_surfaces(repo: Path) -> tuple[list[dict[str, Any]], list[str], int, int, list[str], bool]:
+    """Scan repo for mutable/protected surfaces excluding `.agents/plugins/rsi-harness/`."""
+    mutable: list[dict[str, Any]] = []
+    create_default_agents = False
+
+    has_agents = (repo / "AGENTS.md").is_file()
+    has_claude = (repo / "CLAUDE.md").is_file()
+    if has_agents:
+        mutable.append({"path": "AGENTS.md", "role": "rules"})
+    if has_claude:
+        mutable.append({"path": "CLAUDE.md", "role": "rules"})
+    if not has_agents and not has_claude:
+        mutable.append({"path": "AGENTS.md", "role": "rules"})
+        create_default_agents = True
+
+    has_dot_agents_skills = (repo / ".agents" / "skills").is_dir() or any(
+        (repo / ".agents" / "skills").glob("*/SKILL.md")
     )
+    has_skills_dir = (repo / "skills").is_dir() or any((repo / "skills").glob("*/SKILL.md"))
+    if has_dot_agents_skills:
+        mutable.append({"path": ".agents/skills/*/SKILL.md", "role": "skills"})
+    if has_skills_dir:
+        mutable.append({"path": "skills/*/SKILL.md", "role": "skills"})
+    if not has_dot_agents_skills and not has_skills_dir:
+        mutable.append({"path": "skills/*/SKILL.md", "role": "skills"})
+
+    protected: list[str] = [
+        ".agents/plugins/rsi-harness/hooks.json",
+        ".agents/plugins/rsi-harness/scripts/",
+        ".agents/plugins/rsi-harness/rules/",
+        "benchmarks/",
+    ]
+    for dep_dir in ("vendor", "dist", "build"):
+        if (repo / dep_dir).exists():
+            protected.append(f"{dep_dir}/")
+
+    actual_rules_bytes = 0
+    for entry in mutable:
+        if entry["role"] == "rules":
+            rp = repo / str(entry["path"])
+            if rp.is_file():
+                actual_rules_bytes += len(rp.read_bytes())
+
+    default_max = 24000
+    warnings: list[str] = []
+    if actual_rules_bytes > default_max:
+        recommended_max = ((actual_rules_bytes + 999) // 1000) * 1000
+        warnings.append(
+            f"Existing rules surface is {actual_rules_bytes} bytes (> default {default_max} bytes); "
+            f"adjusting max_rules_bytes to {recommended_max}. Consider Progressive Disclosure or "
+            "rrsi.rules_budget_mode='ratchet'."
+        )
+    else:
+        recommended_max = default_max
+
+    for entry in mutable:
+        if entry["role"] == "rules":
+            entry["max_bytes"] = recommended_max
+
+    return mutable, protected, actual_rules_bytes, recommended_max, warnings, create_default_agents
+
+
+def _render_harness_yaml(
+    runtime: str,
+    check_cmd: str,
+    timeout_sec: int,
+    mutable_surface: list[dict[str, Any]],
+    protected_surface: list[str],
+    max_rules_bytes: int = 24000,
+) -> str:
+    escaped_cmd = check_cmd.replace('"', '\\"')
+    lines = [
+        f'runtime: "{runtime}"',
+        f'inner_check_cmd: "{escaped_cmd}"',
+        f"inner_timeout_sec: {timeout_sec}",
+        "rrsi:",
+        "  n_trials: 1",
+        "  max_files: 3",
+        "  max_diff_lines: 80",
+        f"  max_rules_bytes: {max_rules_bytes}",
+        "mutable_surface:",
+    ]
+    for entry in mutable_surface:
+        lines.append(f'  - path: "{entry["path"]}"')
+        lines.append(f'    role: "{entry["role"]}"')
+        if entry.get("max_bytes") is not None:
+            lines.append(f'    max_bytes: {int(entry["max_bytes"])}')
+    lines.append("protected_surface:")
+    for pat in protected_surface:
+        lines.append(f'  - "{pat}"')
+    return "\n".join(lines) + "\n"
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -89,15 +158,28 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     tc = detect_project_toolchain(repo)
     runtime = _detect_runtime(repo, args.runtime)
-    plugin_rules = repo / ".agents" / "plugins" / "rsi-harness" / "rules" / "AGENTS.md"
-    rules_rel = ".agents/plugins/rsi-harness/rules/AGENTS.md" if plugin_rules.is_file() else "AGENTS.md"
+    (
+        mutable_surface,
+        protected_surface,
+        actual_rules_bytes,
+        recommended_max_rules_bytes,
+        warnings,
+        create_default_agents,
+    ) = _detect_init_surfaces(repo)
 
     harness_path = repo / "harness.yaml"
     config_path = repo / "rsi.config.json"
     agents_path = repo / "AGENTS.md"
     gitignore_path = repo / ".gitignore"
 
-    harness_content = _render_harness_yaml(runtime, tc.check_cmd, tc.default_timeout_sec, rules_rel)
+    harness_content = _render_harness_yaml(
+        runtime,
+        tc.check_cmd,
+        tc.default_timeout_sec,
+        mutable_surface,
+        protected_surface,
+        max_rules_bytes=recommended_max_rules_bytes,
+    )
     config_payload = {
         "runtime": runtime,
         "inner_gate": {
@@ -106,6 +188,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         },
         "rrsi": {
             "n_trials": 1,
+            "max_rules_bytes": recommended_max_rules_bytes,
         },
         "plugins": {
             "proposer": None,
@@ -140,10 +223,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     _handle_file(harness_path, harness_content)
     _handle_file(config_path, json.dumps(config_payload, indent=2) + "\n")
-    if rules_rel == "AGENTS.md":
+    if create_default_agents or (repo / "AGENTS.md").is_file():
         _handle_file(agents_path, agents_content)
-    else:
-        actions.append({"path": rules_rel, "action": "skip", "reason": "plugin_rules_present"})
 
     # .gitignore append-only handling so existing entries are never lost
     if gitignore_path.exists():
@@ -167,6 +248,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "force": bool(args.force),
         "runtime": runtime,
         "toolchain": asdict(tc),
+        "mutable_surface": mutable_surface,
+        "protected_surface": protected_surface,
+        "rules_bytes": actual_rules_bytes,
+        "recommended_max_rules_bytes": recommended_max_rules_bytes,
+        "warnings": warnings,
         "actions": actions,
     }
     if args.json:
@@ -176,6 +262,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"{mode_tag}RSI-Harness init in {repo} (runtime={runtime}, toolchain={tc.language}/{tc.tool}, cmd={tc.check_cmd!r})")
         for act in actions:
             print(f"  - {act['action']}: {act['path']} ({act['reason']})")
+        for warn in warnings:
+            print(f"  ! WARNING: {warn}")
     return 0
 
 
@@ -339,7 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_evolve.add_argument("--seed", type=int, default=None)
     p_evolve.add_argument("--pr-dry-run", action="store_true")
     p_evolve.add_argument("--create-pr", action="store_true")
-    p_evolve.add_argument("--pr-base", default="main")
+    p_evolve.add_argument("--pr-base", default=None, help="Base branch for PR (auto-detected if omitted)")
     p_evolve.add_argument("--mock-bad-proposal", default=None, choices=["leak", "budget", "protected"])
     p_evolve.set_defaults(func=_cmd_evolve)
 

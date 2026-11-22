@@ -100,10 +100,64 @@ def _detect_node_toolchain(cwd: Path) -> ToolchainInfo | None:
         except (OSError, json.JSONDecodeError):
             data = {}
         scripts = data.get("scripts") if isinstance(data, dict) else {}
-        test_script = scripts.get("test") if isinstance(scripts, dict) else None
+        if not isinstance(scripts, dict):
+            scripts = {}
+        raw_deps = data.get("dependencies") if isinstance(data, dict) else {}
+        raw_dev_deps = data.get("devDependencies") if isinstance(data, dict) else {}
+        deps: dict[str, Any] = {}
+        if isinstance(raw_deps, dict):
+            deps.update(raw_deps)
+        if isinstance(raw_dev_deps, dict):
+            deps.update(raw_dev_deps)
+
+        lang = "typescript" if tsconfig.is_file() else "javascript"
+        test_script = scripts.get("test")
         if isinstance(test_script, str) and test_script.strip() and "no test specified" not in test_script:
-            lang = "typescript" if tsconfig.is_file() else "javascript"
             return ToolchainInfo(lang, pm, f"{pm} test", 45, detected)
+
+        def _is_vp(val: str) -> bool:
+            return bool(re.search(r"\bvp\b", val))
+
+        test_markers = ("vp test", "vp check", "vitest", "jest", "bun test", "node --test", "test")
+        for script_name in ("ready", "check", "verify", "ci"):
+            val = scripts.get(script_name)
+            if isinstance(val, str) and val.strip():
+                lower_val = val.lower()
+                if any(marker in lower_val for marker in test_markers):
+                    uses_vp = _is_vp(val)
+                    tool_name = "vite-plus" if uses_vp else pm
+                    timeout = 60 if uses_vp else 45
+                    return ToolchainInfo(lang, tool_name, f"{pm} run {script_name}", timeout, detected)
+
+        check_script = scripts.get("check")
+        if isinstance(check_script, str) and check_script.strip():
+            uses_vp = _is_vp(check_script)
+            return ToolchainInfo(
+                lang,
+                "vite-plus" if uses_vp else pm,
+                f"{pm} run check",
+                45,
+                detected,
+            )
+
+        ready_script = scripts.get("ready")
+        if isinstance(ready_script, str) and ready_script.strip():
+            uses_vp = _is_vp(ready_script)
+            return ToolchainInfo(
+                lang,
+                "vite-plus" if uses_vp else pm,
+                f"{pm} run ready",
+                60 if uses_vp else 45,
+                detected,
+            )
+
+        typecheck_script = scripts.get("typecheck")
+        if isinstance(typecheck_script, str) and typecheck_script.strip():
+            return ToolchainInfo("typescript", pm, f"{pm} run typecheck", 45, detected)
+
+        if "vite-plus" in deps:
+            return ToolchainInfo(lang, "vite-plus", "npx vp check && npx vp test", 60, detected)
+
         if tsconfig.is_file():
             return ToolchainInfo("typescript", "tsc", "npx tsc --noEmit", 45, detected + ["tsconfig.json"])
     elif tsconfig.is_file():
